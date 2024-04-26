@@ -11,7 +11,7 @@ from kooplearn._src.linalg import full_rank_lstsq
 from kooplearn._src.metrics import (vectorized_spectral_scores,
                                     vectorized_correlation_scores)
 from kooplearn.data import TensorContextDataset  # noqa: E402
-from kooplearn.models.ae.utils import flatten_context_data
+from kooplearn.models.ae.utils import flatten_context_data, unflatten_context_data
 from kooplearn.models.base_model import LatentBaseModel, LightningLatentModel, _default_lighting_trainer
 from kooplearn.nn.functional import log_fro_metric_deformation_loss, vectorized_cross_cov
 from kooplearn.utils import check_if_resume_experiment
@@ -122,8 +122,6 @@ class DPNet(LatentBaseModel):
 
         self._is_fitted = True
 
-
-
     def forward(self, state_contexts: TensorContextDataset) -> any:
         r"""Forward pass of the DPNet model.
 
@@ -140,8 +138,35 @@ class DPNet(LatentBaseModel):
         if self.is_fitted:
             return self.evolve_forward(state_contexts)
         else:
-            latent_obs = self.encode_contexts(state=state_contexts, encoder=self.encoder)
-            return dict(latent_obs=latent_obs)
+            return self.encode_contexts(state=state_contexts, encoder=self.encoder)
+
+    @wraps(LatentBaseModel.encode_contexts)
+    def encode_contexts(
+            self, state: TensorContextDataset,
+            encoder: torch.nn.Module, **kwargs
+            ) -> Union[dict, TensorContextDataset]:
+        # We need to handle the scenario where the encoder outputs a tuple of the latent observables in distinct/lagged
+        # representation spaces H and H'.
+        # From (batch, context_length, *features_shape) to (batch * context_length, *features_shape)
+        flat_encoded_contexts = encoder(flatten_context_data(state))
+
+        # From (batch * context_length, latent_dim) to (batch, context_length, latent_dim)
+        if isinstance(flat_encoded_contexts, tuple):  # z_t and z'_t
+            assert len(flat_encoded_contexts) == 2, \
+                f"Expected encoder to return a tuple of two latent observables, but got {len(flat_encoded_contexts)}"
+            latent_obs_contexts_H = unflatten_context_data(flat_encoded_contexts[0],
+                                                           batch_size=len(state),
+                                                           features_shape=(self.latent_dim,))
+            latent_obs_contexts_H_prime = unflatten_context_data(flat_encoded_contexts[1],
+                                                                 batch_size=len(state),
+                                                                 features_shape=(self.latent_dim,))
+
+        else:  # z_t = z'_t
+            latent_obs_contexts_H = unflatten_context_data(flat_encoded_contexts,
+                                                           batch_size=len(state),
+                                                           features_shape=(self.latent_dim,))
+            latent_obs_contexts_H_prime = latent_obs_contexts_H
+        return dict(latent_obs=latent_obs_contexts_H, latent_obs_aux=latent_obs_contexts_H_prime)
 
     def compute_loss_and_metrics(self,
                                  state: Optional[TensorContextDataset] = None,
@@ -175,8 +200,6 @@ class DPNet(LatentBaseModel):
         if not self.is_fitted:
             run_checks = False  # TODO: remove from here, make a test of this.
 
-            if latent_obs_aux is None:
-                latent_obs_aux = latent_obs
             dt = 1
             # Since we assume time homogenous dynamics, the CovX and CovY are "time-independent" so we compute them
             # using the `n=batch * time_horizon` samples, to get better empirical estimates.
@@ -216,7 +239,7 @@ class DPNet(LatentBaseModel):
                                                             run_checks=run_checks)
                 metrics.update(spectral_score=spectral_score.mean().item())
 
-                space_inv_score = corr_scores
+                space_inv_score = torch.clip(corr_scores, max=self.latent_dim)
 
             # Compute the Chapman-Kolmogorov regularization scores for all possible step transitions. In return, we get:
             # ck_regularization[i,j] = || Cov(i, j) - ( Cov(i, i+1), ... Cov(j-1, j) ) ||_2  | j >= i + 2
@@ -234,8 +257,8 @@ class DPNet(LatentBaseModel):
             with torch.no_grad():
                 eigvals_X = torch.linalg.eigvalsh(covX)
                 eigvals_Y = torch.linalg.eigvalsh(covY)
-                metrics.update(rank_H=torch.sum(eigvals_X > torch.max(eigvals_X)*1e-6).item(),
-                               rank_Hprime=torch.sum(eigvals_Y > torch.max(eigvals_Y)*1e-6).item())
+                metrics.update(rank_H=torch.sum(eigvals_X > torch.max(eigvals_X) * 1e-6).item(),
+                               rank_Hprime=torch.sum(eigvals_Y > torch.max(eigvals_Y) * 1e-6).item())
 
             # Compute the loss
             # =============================================================================================
@@ -244,7 +267,7 @@ class DPNet(LatentBaseModel):
             # max value of orthogonal regularization is 1.0
             orth_regularization = alpha_orth * metric_def_loss.mean()  # / self.obs_state_dim
             # Add max orth_reg to make it positive.
-            score = space_inv_score.mean() - orth_regularization # - (alpha_orth * self.latent_dim)
+            score = space_inv_score.mean() - orth_regularization  # - (alpha_orth * self.latent_dim)
 
             # Change sign to minimize the loss and maximize the score.
             loss = -score

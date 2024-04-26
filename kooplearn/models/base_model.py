@@ -284,6 +284,7 @@ class LatentBaseModel(kooplearn.abc.BaseModel, torch.nn.Module, ABC):
             eval_right_on.to(device=self.evolution_operator.device, dtype=self.evolution_operator.dtype)
             # Compute the latent observables for the data (batch, context_len, latent_dim)
             z_t = self.encode_contexts(state=eval_right_on, encoder=self.encoder)
+            z_t = z_t['latent_obs'] if isinstance(z_t, dict) else z_t
             # Evaluation of eigenfunctions in (batch/n_samples, context_len, latent_dim)
             # TODO: This is the batch form equivalent of primal.evaluate_eigenfunction with the additional feature of
             #  performing the operation on the selected device (cpu or gpu)
@@ -296,6 +297,7 @@ class LatentBaseModel(kooplearn.abc.BaseModel, torch.nn.Module, ABC):
             eval_left_on.to(device=self.evolution_operator.device, dtype=self.evolution_operator.dtype)
             # Compute the latent observables for the data (batch, context_len, latent_dim)
             z_t = self.encode_contexts(state=eval_left_on, encoder=self.encoder)
+            z_t = z_t['latent_obs'] if isinstance(z_t, dict) else z_t
             # Evaluation of eigenfunctions in parallel batch form (..., context_len, latent_dim)
             # left_eigfn[...,t, i] = <v_i, z_t>_C : i=1,...,l
             # TODO: This is the batch form equivalent of primal.evaluate_eigenfunction with the additional feature of
@@ -417,7 +419,7 @@ class LatentBaseModel(kooplearn.abc.BaseModel, torch.nn.Module, ABC):
                         data,
                         self.lookback_len,
                         t,
-                        self.lightning_module.encoder,
+                        self.lightning_module.backbone,
                         self.lightning_module.decoder,
                         self.lightning_module.evolution_operator,
                         )
@@ -543,7 +545,8 @@ class LatentBaseModel(kooplearn.abc.BaseModel, torch.nn.Module, ABC):
                                trainer: lightning.Trainer,
                                lightning_module: 'LightningLatentModel',
                                train_dataloader: DataLoader,
-                               ckpt_path: Optional[pathlib.Path] = None) -> tuple[TensorContextDataset]:
+                               ckpt_path: Optional[pathlib.Path] = None
+                               ) -> tuple[TensorContextDataset, TensorContextDataset]:
         """ Obtain the samples of states X and latent observables Z for all training dataset.
 
         Note that the `LightningLatentModel.predict_step` returns the latent observables and the input states. Both are

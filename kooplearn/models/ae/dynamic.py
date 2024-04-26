@@ -161,51 +161,26 @@ class DynamicAE(LatentBaseModel):
                 train_dataloaders=train_dataloaders,
                 val_dataloaders=val_dataloaders,
                 datamodule=datamodule,
-                ckpt_path=ckpt_path,
+                ckpt_path=ckpt_path if ckpt_path.exists() else None,
                 )
             self._is_fitted = self.trainer.state.finished
 
         if self.lin_decoder is None:  # If decoder is non-linear, for mode decomposition we fit a linear decoder
-            logger.info(f"Fitting linear decoder for mode decomposition")
-            # TODO: remove from here, this seems to be experiment specific.
-            if datamodule is not None and hasattr(datamodule, "augment"):
-                datamodule.augment = False
-
-            # Get latent observables of training dataset
-            train_dataset = train_dataloaders.dataset if train_dataloaders is not None else datamodule.train_dataset
+            # Get latent observables of training dataset ===============================================================
             train_dataloader = train_dataloaders if train_dataloaders is not None else datamodule.train_dataloader()
-            predict_out = trainer.predict(model=lightning_module, dataloaders=train_dataloader, ckpt_path=best_path)
-            Z = [out_batch['latent_obs'] for out_batch in predict_out]
-            Z = TensorContextDataset(torch.cat([z.data for z in Z], dim=0))  # (n_samples, context_len, latent_dim)
+            X, Z = self._predict_training_data(trainer, lightning_module, train_dataloader, ckpt_path=best_path)
 
-            # # Fit the evolution operator using least squares =============================================================
-            # Z_0 = Z.data[:, 0, :]
-            # Z_1 = Z.data[:, 1, :]
-            # evol_op, _ = full_rank_lstsq(X=Z_0.T, Y=Z_1.T, bias=False)
-            # # Reset the evolution operator to the fitted one
-            # self.linear_dynamics.weight.data = evol_op
-            # print("\n ------------------- \n Fitted evolution operator: \n")
-
-            # Fit linear decoder to perform dynamic mode decomposition =====================================================
-            # TODO: add to checkpoint after training. Avoid recomputing this if already fitted.
-            # Denote by φ(x) an eigenfunction of the evolution operator T = VΛV⁻¹, where V is the matrix of eigenvectors
-            # and Λ is the diagonal matrix of eigenvalues. The vector of eigenfunctions is computed as
-            # `Ψ(x_t)=V⁻¹z_t = V⁻¹Ψ(x_t)`. Where Ψ:X→Z is the encoder/obs_function. If we want to do mode decomposition
-            # we have that z_t+1 = Σ_i V_[i,:] @ (λ_i · φ_i(x_t)). Because the learned decoder is non-linear we cannot
-            # transfer the mode decomposition to the state-space as Ψ⁻¹(z_1,t + z_2,t) != Ψ⁻¹(z_1,t) + Ψ⁻¹(z_2,t).
-            # Thus, after learning the representation space Z, we fit a *linear* decoder `Ψ⁻¹_lin : Z → X` to perform mode
-            # decomposition by x_t+1 = Ψ⁻¹_lin(Σ_i V_[i,:] @ (λ_i · Ψ_i(x_t))).
-
-            # (n_samples * context_len, latent_dim)
-            Z_flat = flatten_context_data(Z)
-            # (n_samples * context_len, state_dim)
-            X_flat = flatten_context_data(train_dataset).to(device=Z_flat.device)
+            Z_flat = flatten_context_data(Z)  # (n_samples * context_len, latent_dim)
+            X_flat = flatten_context_data(X).to(device=Z_flat.device)  # (n_samples * context_len, state_dim)
 
             # Store the linear_decoder=`Ψ⁻¹_lin: Z -> X` as a non-trainable `torch.nn.Linear` Module.
             lin_decoder = self.fit_linear_decoder(states=X_flat.T, latent_states=Z_flat.T)
             self.lin_decoder = lin_decoder.to(device=self.evolution_operator.device)
 
-            # Update the checkpoint file with the fitted linear decoder and evolution operator
+            # Compute the evolution operator eigendecomposition =======================================================
+            self.eig()
+
+            # Update the checkpoint file with the fitted linear decoder, evolution operator and eigdecomposition cache.
             ckpt = torch.load(best_path)
             ckpt['state_dict'].update(**lightning_module.state_dict())
             torch.save(ckpt, best_path)

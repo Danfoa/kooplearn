@@ -7,13 +7,13 @@ import numpy as np
 import scipy
 
 from kooplearn._src.check_deps import check_torch_deps
-from kooplearn._src.linalg import vectorized_cov_cross_cov, full_rank_lstsq
+from kooplearn._src.linalg import full_rank_lstsq
 from kooplearn._src.metrics import (vectorized_spectral_scores,
                                     vectorized_correlation_scores)
 from kooplearn.data import TensorContextDataset  # noqa: E402
 from kooplearn.models.ae.utils import flatten_context_data
 from kooplearn.models.base_model import LatentBaseModel, LightningLatentModel, _default_lighting_trainer
-from kooplearn.nn.functional import log_fro_metric_deformation_loss
+from kooplearn.nn.functional import log_fro_metric_deformation_loss, vectorized_cross_cov
 from kooplearn.utils import check_if_resume_experiment
 
 check_torch_deps()
@@ -92,47 +92,37 @@ class DPNet(LatentBaseModel):
                 ckpt_path=ckpt_path if ckpt_path.exists() else None,
                 )
 
-            # if self.decoder is None or self.evolution_operator is None:  # After latent space Z is learned,
-            # we fit a linear decoder
-            logger.info(f"Fitting linear decoder for mode decomposition")
-            # TODO: remove from here, this seems to be experiment specific.
-            if datamodule is not None and hasattr(datamodule, "augment"):
-                datamodule.augment = False
+        # Get latent observables of training dataset ===================================================================
+        train_dataloader = train_dataloaders if train_dataloaders is not None else datamodule.train_dataloader()
+        X, Z = self._predict_training_data(trainer, lightning_module, train_dataloader, ckpt_path=best_path)
 
-            # Get latent observables of training dataset
-            train_dataset = train_dataloaders.dataset if train_dataloaders is not None else datamodule.train_dataset
-            train_dataloader = train_dataloaders if train_dataloaders is not None else datamodule.train_dataloader()
-            predict_out = trainer.predict(model=lightning_module,
-                                          dataloaders=train_dataloader,
-                                          ckpt_path=best_path if best_path.exists() else None)
-            Z = [out_batch['latent_obs'] for out_batch in predict_out]
-            Z = TensorContextDataset(torch.cat([z.data for z in Z], dim=0))  # (n_samples, context_len, latent_dim)
+        Z_flat = flatten_context_data(Z)  # (n_samples * context_len, latent_dim)
+        X_flat = flatten_context_data(X).to(device=Z_flat.device)  # (n_samples * context_len, state_dim)
 
-            # TODO: Make this a separate method
-            Z_0 = Z.data[:, 0, :]
-            Z_1 = Z.data[:, 1, :]
-            T, _ = full_rank_lstsq(X=Z_0.T, Y=Z_1.T, bias=False)
+        # Fit linear decoder to perform dynamic mode decomposition =====================================================
+        # Store the linear_decoder=`Ψ⁻¹_lin: Z -> X` as a non-trainable `torch.nn.Linear` Module.
+        self.decoder = self.fit_linear_decoder(states=X_flat.T, latent_states=Z_flat.T)
 
-            linear_dynamics = torch.nn.Linear(in_features=self.latent_dim, out_features=self.latent_dim, bias=False)
-            linear_dynamics.weight.data = T
-            linear_dynamics.weight.requires_grad = False
-            self.linear_dynamics = linear_dynamics
+        # Fit the evolution operator ===================================================================================
+        Z_t = flatten_context_data(Z[:, :-1, :])
+        Z_t_dt = flatten_context_data(Z[:, 1:, :])
+        T, _ = full_rank_lstsq(X=Z_t.T, Y=Z_t_dt.T, bias=False)
 
-            # (n_samples * context_len, latent_dim)
-            Z_flat = flatten_context_data(Z)
-            # (n_samples * context_len, state_dim)
-            X_flat = flatten_context_data(train_dataset).to(device=Z_flat.device)
+        linear_dynamics = torch.nn.Linear(in_features=self.latent_dim, out_features=self.latent_dim, bias=False)
+        linear_dynamics.weight.data = T
+        linear_dynamics.weight.requires_grad = False
+        self.linear_dynamics = linear_dynamics
 
-            # Store the linear_decoder=`Ψ⁻¹_lin: Z -> X` as a non-trainable `torch.nn.Linear` Module.
-            self.decoder = self.fit_linear_decoder(states=X_flat.T, latent_states=Z_flat.T)
-
-            if best_path.exists():
-                # Update the checkpoint file with the fitted linear decoder and evolution operator
-                ckpt = torch.load(best_path)
-                ckpt['state_dict'].update(**lightning_module.state_dict())
-                torch.save(ckpt, best_path)
+        # Update the checkpoint file with the fitted linear decoder and evolution operator ============================
+        if best_path.exists():
+            # Update the checkpoint file with the fitted linear decoder and evolution operator
+            ckpt = torch.load(best_path)
+            ckpt['state_dict'].update(**lightning_module.state_dict())
+            torch.save(ckpt, best_path)
 
         self._is_fitted = True
+
+
 
     def forward(self, state_contexts: TensorContextDataset) -> any:
         r"""Forward pass of the DPNet model.
@@ -184,51 +174,49 @@ class DPNet(LatentBaseModel):
 
         if not self.is_fitted:
             run_checks = False  # TODO: remove from here, make a test of this.
-            # Compute the empirical covariance and cross-covariance operators, ensuring that operators are equivariant.
-            # CCov[i, j]   := Cov(z_i, z'_j)     | i,j in [time_horizon], j > i  --> i.e.,  Upper triangular tensor
-            # Cov[t]       := Cov(z_t, z_t)      | t in [time_horizon]
-            # Cov_prime[t] := Cov(z'_t,z'_t)     | t in [time_horizon]
+
+            if latent_obs_aux is None:
+                latent_obs_aux = latent_obs
             dt = 1
-            CCov, Cov, Cov_prime = vectorized_cov_cross_cov(
+            # Since we assume time homogenous dynamics, the CovX and CovY are "time-independent" so we compute them
+            # using the `n=batch * time_horizon` samples, to get better empirical estimates.
+            batch, time_horizon, _ = latent_obs.data.shape
+            n_samples = batch * time_horizon
+            covX = torch.einsum("btx,bty->xy", latent_obs.data, latent_obs.data) / n_samples
+            covY = torch.einsum("btx,bty->xy", latent_obs_aux.data, latent_obs_aux.data) / n_samples
+
+            # CovXY[i, j] := Cov(z_i, z'_j)     | i,j in [time_horizon], j >= i  --> i.e.,  Upper triangular tensor
+            covXY = vectorized_cross_cov(
                 X_contexts=latent_obs.data[:, :-dt, :],
-                Y_contexts=latent_obs_aux.data if latent_obs_aux is not None else latent_obs.data[:, dt:, :],
+                Y_contexts=latent_obs_aux.data[:, dt:, :],
                 cov_window_size=None,
                 representation=None,
                 run_checks=run_checks)
 
-            # Logarithmic + Frobenious metric deformation loss
-            metric_def_loss_Z = log_fro_metric_deformation_loss(Cov)
-            if latent_obs_aux is not None:
-                metric_def_loss_Z_prime = log_fro_metric_deformation_loss(Cov_prime)
-                metric_def_loss = (metric_def_loss_Z + metric_def_loss_Z_prime) / 2.0
-            else:
-                metric_def_loss = metric_def_loss_Z
-
-            metrics.update(orth_reg=metric_def_loss.mean().item())
-
             if self.use_spectral_score:
                 # spectral_score := mean(||Cov(t, t+dt)||^2_HS/(||Cov(t)|| ||Cov(t+dt)||)) | t, dt in [1, time_horizon)
-                spectral_score = vectorized_spectral_scores(CCov=CCov,
-                                                            Cov=Cov,
-                                                            Cov_prime=Cov_prime,
+                spectral_score = vectorized_spectral_scores(covXY=covXY,
+                                                            covX=covX,
+                                                            covY=covY,
                                                             run_checks=run_checks)
                 metrics.update(spectral_score=spectral_score.mean().item())
-                latent_space_invariance_score = spectral_score
-                #
-                # # corr_scores[dt - 1] := ||Cov(t)^-1 Cov(t, t+dt) Cov(t+d)^-1||^2_HS        | dt in [1, time_horizon)
-                # corr_scores = vectorized_correlation_scores(CCov=CCov,
-                #                                             Cov=Cov,
-                #                                             Cov_prime=Cov_prime,
-                #                                             run_checks=run_checks)
-                # metrics.update(corr_score=corr_scores.mean().item())
+                space_inv_score = spectral_score
             else:
                 # corr_scores[dt - 1] := ||Cov(t)^-1 Cov(t, t+dt) Cov(t+d)^-1||^2_HS        | dt in [1, time_horizon)
-                corr_scores = vectorized_correlation_scores(CCov=CCov,
-                                                            Cov=Cov,
-                                                            Cov_prime=Cov_prime,
+                torch.autograd.set_detect_anomaly(True)
+                corr_scores = vectorized_correlation_scores(covXY=covXY,
+                                                            covX=covX,  # illegal memory access if not clone
+                                                            covY=covY,  # dunno wtf is happening here.
                                                             run_checks=run_checks)
                 metrics.update(corr_score=corr_scores.mean().item())
-                latent_space_invariance_score = corr_scores
+
+                spectral_score = vectorized_spectral_scores(covXY=covXY,
+                                                            covX=covX,
+                                                            covY=covY,
+                                                            run_checks=run_checks)
+                metrics.update(spectral_score=spectral_score.mean().item())
+
+                space_inv_score = corr_scores
 
             # Compute the Chapman-Kolmogorov regularization scores for all possible step transitions. In return, we get:
             # ck_regularization[i,j] = || Cov(i, j) - ( Cov(i, i+1), ... Cov(j-1, j) ) ||_2  | j >= i + 2
@@ -237,24 +225,29 @@ class DPNet(LatentBaseModel):
             #                                                       ck_window_length=max_ck_window_length,
             #                                                       debug=debug)
 
+            # Orthogonality regularization ================================================================
+            # Logarithmic + Frobenious metric deformation loss
+            metric_def_loss = (log_fro_metric_deformation_loss(covX) + log_fro_metric_deformation_loss(covY)) / 2.0
+            metrics.update(orth_reg=metric_def_loss.mean().item())
+
+            # Additional metrics =========================================================================
+            with torch.no_grad():
+                eigvals_X = torch.linalg.eigvalsh(covX)
+                eigvals_Y = torch.linalg.eigvalsh(covY)
+                metrics.update(rank_H=torch.sum(eigvals_X > torch.max(eigvals_X)*1e-6).item(),
+                               rank_Hprime=torch.sum(eigvals_Y > torch.max(eigvals_Y)*1e-6).item())
+
             # Compute the loss
             # =============================================================================================
-            alpha_orth = self.loss_weights.get('orthonormality', 1.0)
-
-            # Max value of score is self.latent_dim
-            latent_space_invariance_score = torch.mean(latent_space_invariance_score)
+            alpha_orth = self.loss_weights.get('orthonormality', 1.0) * 100
 
             # max value of orthogonal regularization is 1.0
             orth_regularization = alpha_orth * metric_def_loss.mean()  # / self.obs_state_dim
-
             # Add max orth_reg to make it positive.
-            score = latent_space_invariance_score - orth_regularization # - (alpha_orth * self.latent_dim)
-            # score = score - ck_regularization
+            score = space_inv_score.mean() - orth_regularization # - (alpha_orth * self.latent_dim)
 
             # Change sign to minimize the loss and maximize the score.
             loss = -score
-            assert not torch.isnan(loss), f"Loss is NaN."
-
             metrics.update(loss=loss)
 
         # If model is fitted and state/latent_obs_state predictions are given, compute the reconstruction, prediction

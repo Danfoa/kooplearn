@@ -1,21 +1,22 @@
 import logging
 import os
+import pathlib
 import time
 from abc import ABC, abstractmethod
 from typing import Any, Optional, Union
 
+import kooplearn
 import lightning
 import numpy as np
 import scipy
 import torch
 import torch.optim
-
-import kooplearn
 from kooplearn._src.serialization import pickle_load, pickle_save
 from kooplearn._src.utils import check_is_fitted, flatten_dict
 from kooplearn.data import TensorContextDataset
 from kooplearn.models.ae.utils import flatten_context_data, multi_matrix_power, unflatten_context_data
 from kooplearn.utils import ModesInfo
+from torch.utils.data import DataLoader
 
 logger = logging.getLogger("kooplearn")
 
@@ -74,7 +75,8 @@ class LatentBaseModel(kooplearn.abc.BaseModel, torch.nn.Module, ABC):
         r"""Forward pass of the torch.nn.Module. By default this method calls the `evolve_forward` method.
 
         Args:
-            state_contexts (TensorContextDataset): The state to be evolved forward. This should be a trajectory of states
+            state_contexts (TensorContextDataset): The state to be evolved forward. This should be a trajectory of
+            states
             :math:`(x_t)_{t\\in\\mathbb{T}}` in the context window :math:`\\mathbb{T}`.
         Returns:
             Any: The output of the forward pass.
@@ -507,8 +509,11 @@ class LatentBaseModel(kooplearn.abc.BaseModel, torch.nn.Module, ABC):
         #     )
         return restored_obj
 
+    @torch.no_grad()
     def fit_linear_decoder(self, latent_states: torch.Tensor, states: torch.Tensor) -> torch.nn.Module:
         """Fit a linear decoder mapping the latent state space Z to the state space X. use for mode decomp."""
+
+        logger.info(f"Fitting linear decoder for {self.__class__.__name__} model")
         use_bias = False  # TODO: Unsure if to enable. This can be another hyperparameter, or set to true by default.
 
         # Solve the least squares problem to find the linear decoder matrix and bias
@@ -532,6 +537,47 @@ class LatentBaseModel(kooplearn.abc.BaseModel, torch.nn.Module, ABC):
             lin_decoder.bias.requires_grad = False
 
         return lin_decoder
+
+    @torch.no_grad()
+    def _predict_training_data(self,
+                               trainer: lightning.Trainer,
+                               lightning_module: 'LightningLatentModel',
+                               train_dataloader: DataLoader,
+                               ckpt_path: Optional[pathlib.Path] = None) -> tuple[TensorContextDataset]:
+        """ Obtain the samples of states X and latent observables Z for all training dataset.
+
+        Note that the `LightningLatentModel.predict_step` returns the latent observables and the input states. Both are
+        needed as the train dataloader could be configured to perform shuffling/augmentation or other transformations
+        to the input data before feeding it to the encoder.
+
+        As Lightning automatically sends outputs to CPU, so we don't need to care about GPU memory.
+
+        Args:
+            trainer:
+            lightning_module:
+            train_dataloader:
+            ckpt_path:
+        Returns:
+            X: TensorContextDataset of states X of shape (n_samples, context_len, **state_feature_shape)
+            Z: TensorContextDataset of latent observables Z of shape (n_samples, context_len, latent_dim)
+        """
+
+        predict_out = trainer.predict(model=lightning_module,
+                                      dataloaders=train_dataloader,
+                                      ckpt_path=ckpt_path if (ckpt_path and ckpt_path.exists()) else None)
+
+        # This structure of the output is enforced by the predict_step method of the LightningLatentModel
+        Z = [out_batch['latent_obs'] for out_batch in predict_out]
+        Z = TensorContextDataset(torch.cat([z.data for z in Z], dim=0))  # (n_samples, context_len, latent_dim)
+        X = [out_batch['state'] for out_batch in predict_out]
+        X = TensorContextDataset(torch.cat([x.data for x in X], dim=0))  # (n_samples, context_len, state_dim)
+
+        # Check the shapes
+        assert Z.shape[-1] == self.latent_dim, f"Expected latent_dim {self.latent_dim}, got {Z.shape[-1]}"
+        assert X.shape[2:] == self.state_features_shape, \
+            f"Expected state_features_shape {self.state_features_shape}, got {X.shape[2:]}"
+
+        return X, Z
 
     def _dry_run(self, state: TensorContextDataset):
         class_name = self.__class__.__name__
@@ -654,7 +700,7 @@ class LightningLatentModel(lightning.LightningModule):
 
     def predict_step(self, batch, batch_idx, **kwargs):
         with torch.no_grad():
-            return self(batch)
+            return self(batch) | dict(state=batch)
 
     def log_metrics(self, metrics: dict, suffix='', batch_size=None):
         flat_metrics = flatten_dict(metrics)
@@ -669,7 +715,7 @@ class LightningLatentModel(lightning.LightningModule):
         self.log('time_per_epoch', time.time() - self._epoch_start_time, prog_bar=False, on_epoch=True)
 
     def configure_optimizers(self) -> Any:
-        if "lr" in self._optimizer_kwargs:  # For Lightning's LearningRateFinder
+        if "lr" in self._optimizer_kwargs:
             self.lr = self._optimizer_kwargs["lr"]
         else:
             self.lr = 1e-3

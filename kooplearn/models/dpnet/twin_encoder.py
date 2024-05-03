@@ -24,6 +24,10 @@ class TwinEncoder(torch.nn.Module):
         super().__init__()
         self.backbone = backbone
         self.equivariant = isinstance(backbone, EquivariantModule)
+        self.activation = torch.nn.Identity()
+
+        activation_name = self.activation.__class__.__name__.lower()
+        activation_name = "linear" if activation_name == "selu" or activation_name == 'identity' else activation_name
 
         # Setting the bias of the linear layer to true is equivalent to setting the constant function in the basis
         # of the space of functions. Then the bias of each dimension is the coefficient of the constant function.
@@ -34,22 +38,25 @@ class TwinEncoder(torch.nn.Module):
             self.obs_H = escnn.nn.Linear(
                 in_type=self.backbone.out_type,
                 out_type=latent_state_type,
-                bias=True)
+                bias=False)
             self.obs_H_prime = escnn.nn.Linear(
                 in_type=self.backbone.out_type,
                 out_type=latent_state_type,
-                bias=True)
+                bias=False)
         else:
             assert latent_dim is not None and hidden_dim is not None, \
                 f"Both latent and hidden dimensions must be provided when using non-equivariant encoder"
             self.obs_H = torch.nn.Linear(
                 in_features=hidden_dim,
                 out_features=latent_dim,
-                bias=True)
+                bias=False)
             self.obs_H_prime = torch.nn.Linear(
                 in_features=hidden_dim,
                 out_features=latent_dim,
-                bias=True)
+                bias=False)
+            torch.nn.init.kaiming_normal_(self.obs_H.weight, nonlinearity=activation_name)
+            torch.nn.init.kaiming_normal_(self.obs_H_prime.weight, nonlinearity=activation_name)
+
 
     def forward(self, input):
         features = self.backbone(input)
@@ -57,6 +64,6 @@ class TwinEncoder(torch.nn.Module):
         z = self.obs_H(features)
         z_prime = self.obs_H_prime(features)
 
-        return z, z_prime
+        return self.activation(z), self.activation(z_prime)
 
 

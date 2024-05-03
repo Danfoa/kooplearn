@@ -70,129 +70,93 @@ def spectral_score(cov_x, cov_y, cov_xy):
     return score
 
 
-def vectorized_spectral_scores(covXY: torch.Tensor,
+def vectorized_spectral_scores(covYXdt: torch.Tensor,
                                covX: torch.Tensor,
                                covY: torch.Tensor,
                                run_checks: bool = False):
     """ Compute the spectral and correlation scores using the cross-covariance operators between distinct time steps.
 
     Args:
-        covXY: (time_horizon, time_horizon, state_dim, state_dim) Tensor containing all the Cross-Covariance
-         empirical operators between the states in the main trajectory and states in the auxiliary trajectory.
-         Each entry of the tensor is a (state_dim, state_dim) covariance estimate.
-         Such that CCov(i,j) = Cov(x_i, x'_j) ∀ i, j in [0, time_horizon], j >= i.
-        covX: (state_dim, state_dim) Tensor containing all the Covariance empirical operators between time
-         steps on the main state space. Cov(i) = Cov(x_i, x_i) ∀ i in [0, time_horizon]
-        covY: (state_dim, state_dim) Tensor containing all the Covariance empirical operators between
-         time steps on the auxiliary state space. Cov_prime(i) = Cov(x'_i, x'_i) ∀ i in [0, time_horizon]
-        window_size: (int) Maximum window length to compute the spectral score. Defaults to None, in which case the
-         score is computed for all window_size > j >= i
+        covYXdt: (T, |Y|, |X|) Tensor containing all the Cross-Covariance
+         empirical operators two multivariate random variables X and Y. Such that CovYX(dt-1) = Cov(y_i+dt, x_i) for
+         all i in [0, time_horizon - dt], dt in [1, T].
+        covX: (|X|, |X|) CovX = Cov(x_i, x_i) ∀ i in Integers
+        covY: (|Y|, |Y|) CovY = Cov(y_i, y_i) ∀ i in Integers
         run_checks: (bool) Whether to print debug information on the scores computed. Defaults to False.
     Returns:
-        spectral_scores: (time_horizon - 1) Tensor containing the average spectral score between time steps separated
+        spectral_scores: (T,) Tensor containing the spectral score between time steps separated
          apart by a shift of `dt` [steps/time]. That is:
             spectral_score[dt - 1] = avg(||Cov(x_i, x'_i+dt)||_HS^2/(||Cov(x_i, x_i)||_2*||Cov(x'_i+dt, x'_i+dt)||_2))
              | ∀ i in [0, time_horizon - dt], dt in [1, min(time_horizon - i, window_size)]
     """
-    assert (len(covXY.shape) == 4 and covXY.shape[0] == covXY.shape[1] and covXY.shape[2] == covXY.shape[3]), \
-        f"CCov:{covXY.shape}. Expected Cov_t_dt of shape (T, T, state_dim, state_dim)"
-    assert len(covX.shape) == 2 and covX.shape[-1] == covX.shape[-2], \
-        f"Cov:{covX.shape}. Expected Cov of shape (state_dim, state_dim)"
-    assert covX.shape == covY.shape, f"Expected Cov_prime of shape (state_dim, state_dim)"
+    dimX, dimY = covYXdt.shape[-1], covYXdt.shape[-2]
+    assert covYXdt.ndim == 3 and dimX == covYXdt.shape[-1] and dimY == covYXdt.shape[-2], \
+        f"CovYXdt{covYXdt.shape}. Expected shape (T, |Y|, |X|)"
+    assert covX.shape[-1] == covX.shape[-2], f"CovX:{covX.shape}. Expected shape (|X|, |X|)"
+    assert covY.shape[-1] == covY.shape[-2], f"CovY:{covY.shape}. Expected shape (|Y|, |Y|)"
 
-    time_horizon = covXY.shape[0]
-
-    # Compute the norm of the diagonal of the covariance matrices is a single parallel operation.
     norm_covX = torch.linalg.matrix_norm(covX, ord=2)  # norm_Cov_t = ||Cov(x, x)||_2
     norm_covY = torch.linalg.matrix_norm(covY, ord=2)  # norm_Cov_t = ||Cov(x', x')||_2
-
-    # Since we are only interested in the terms ||Cov(x_i, x'_j)||_HS  s.t j > i, we compute the upper triangular part
-    # the norms of the "upper triangular" part of the (time, time, ...) axis of the CCov matrix.
-    # Get indices for the upper triangular part, including the diagonal
-    # TODO: this introduces unnecessary copies, we should avoid them
-    idx_i, idx_j = torch.triu_indices(time_horizon, time_horizon, device=covXY.device)
-    # Instead of computing the norm for (time x time) matrices, instead compute the (time(time-1)/2) upper triangular
-    norms_CCov = torch.linalg.matrix_norm(covXY[idx_i, idx_j], ord='fro', dim=(-2, -1))
+    norms_CCov = torch.linalg.matrix_norm(covYXdt, ord='fro', dim=(-2, -1)) # ||Cov(y_i+dt, x_i)||_HS for all i
 
     scores = norms_CCov ** 2 / (norm_covX * norm_covY)
 
     if run_checks:  # Check vectorized operations are equivalent to sequential operations
-        for i, j, score_ij, norm in zip(idx_i, idx_j, scores, norms_CCov):
-            exp = score_ij
-            real = spectral_score(cov_x=covX, cov_y=covY, cov_xy=covXY[i, j])
+        for idx in range(len(scores)):
+            dt = idx + 1
+            exp = scores[idx]
+            real = spectral_score(cov_x=covX, cov_y=covY, cov_xy=covYXdt[dt - 1])
             assert torch.allclose(exp, real, atol=1e-5), f"Spectral scores do not match {exp}!={real}"
-            if i > 1: break
 
-    return scores.mean()
+    return scores
 
 
-def vectorized_correlation_scores(covXY: torch.Tensor,
+def vectorized_correlation_scores(covYXdt: torch.Tensor,
                                   covX: torch.Tensor,
                                   covY: torch.Tensor,
-                                  window_size: Optional[int] = None,
                                   run_checks: bool = False):
     """ Compute the correlation scores using the cross-covariance operators between distinct time steps.
 
     Args:
-        covXY: (time_horizon, time_horizon, state_dim, state_dim) Tensor containing all the Cross-Covariance
-         empirical operators between the states in the main trajectory and states in the auxiliary trajectory.
-         Each entry of the tensor is a (state_dim, state_dim) covariance estimate.
-         Such that CCov(i,j) = Cov(x_i, x'_j) ∀ i, j in [0, time_horizon], j >= i.
-        covX: (state_dim, state_dim) Tensor containing all the Covariance empirical operators between time
-         steps on the main state space. Cov(i) = Cov(x_i, x_i) ∀ i in [0, time_horizon]
-        covY: (state_dim, state_dim) Tensor containing all the Covariance empirical operators between
-         time steps on the auxiliary state space. Cov_prime(i) = Cov(x'_i, x'_i) ∀ i in [0, time_horizon]
-        window_size: (int) Maximum window length to compute the spectral score. Defaults to None, in which case the
-         score is computed for all window_size > j >= i
+        covYXdt: (T, |Y|, |X|) Tensor containing all the Cross-Covariance
+         empirical operators two multivariate random variables X and Y. Such that CovYX(dt-1) = Cov(y_i+dt, x_i) for
+         all i in [0, time_horizon - dt], dt in [1, T].
+        covX: (|X|, |X|) CovX = Cov(x_i, x_i) ∀ i in Integers
+        covY: (|Y|, |Y|) CovY = Cov(y_i, y_i) ∀ i in Integers
         run_checks: (bool) Whether to print debug information on the scores computed. Defaults to False.
     Returns:
-        corr_scores: (time_horizon - 1) Tensor containing the correlation scores between time steps separated
+        corr_scores: (T,) Tensor containing the correlation scores between time steps separated
          apart by a shift of `dt` [steps/time]. That is:
             corr_score[dt - 1] = avg(||Cov(x_i, x_i)^-1 Cov(x_i, x'_i+dt) Cov(x'_i+dt, x'_i+dt)^-1||_HS^2)
              | ∀ i in [0, time_horizon - dt], dt in [1, min(time_horizon - i, window_size)]
     """
-    assert (len(covXY.shape) == 4 and covXY.shape[0] == covXY.shape[1] and covXY.shape[2] == covXY.shape[3]), \
-        f"CCov:{covXY.shape}. Expected Cov_t_dt of shape (T, T, state_dim, state_dim)"
-    assert len(covX.shape) == 2 and covX.shape[-1] == covX.shape[-2], \
-        f"Cov:{covX.shape}. Expected Cov of shape (state_dim, state_dim)"
-    assert covX.shape == covY.shape, f"Expected Cov_prime of shape (state_dim, state_dim)"
+    dimX, dimY = covYXdt.shape[-1], covYXdt.shape[-2]
+    assert covYXdt.ndim == 3 and dimX == covYXdt.shape[-1] and dimY == covYXdt.shape[-2], \
+        f"CovYXdt{covYXdt.shape}. Expected shape (T, |Y|, |X|)"
+    assert covX.shape[-1] == covX.shape[-2], f"CovX:{covX.shape}. Expected shape (|X|, |X|)"
+    assert covY.shape[-1] == covY.shape[-2], f"CovY:{covY.shape}. Expected shape (|Y|, |Y|)"
 
-    time_horizon = covXY.shape[0]
-
-    # Since we are only interested in the terms Cov(x_i, x'_j)  s.t j > i, we compute the upper triangular part
-    # the norms of the "upper triangular" part of the (time, time, ...) axis of the CCov matrix.
-    # Get indices for the upper triangular part, including the diagonal
-    idx_i, idx_j = torch.triu_indices(time_horizon, time_horizon, device=covXY.device)
-
-    # # Mildly stable and fast in backward pass !!!!
-    # cov_inv_sqrt, cond_num_Cov = batch_matrix_sqrt_inv(torch.stack([covX, covY]), run_checks=run_checks)
-    # cov_X_inv_sqrt = cov_inv_sqrt[0]
-    # cov_Y_inv_sqrt = cov_inv_sqrt[1]
-    #
-    # covX_inv_CovXY = torch.einsum("ab,tbc->tac", cov_X_inv_sqrt, covXY[idx_i, idx_j])  # covX.pinv() @ covXY
-    # covX_inv_CovXY_covY_inv = torch.einsum("tac,cd->tad", covX_inv_CovXY, cov_Y_inv_sqrt)  # covX.pinv() @ covXY @ covY
+    time_horizon = covYXdt.shape[0]
+    # Unstable but fast in backward pass  !!!!
+    # cov_xy_flat = covXY[idx_i, idx_j]
+    # covX_inv_CovXY = torch.einsum("ab,tbc->tac", torch.linalg.pinv(covX, hermitian=True),
+    #                               cov_xy_flat)  # covX.pinv() @ covXY
+    # covX_inv_CovXY_covY_inv = torch.einsum("tac,cd->tad", covX_inv_CovXY,
+    #                                        torch.linalg.pinv(covY, hermitian=True))  # covX.pinv() @ covXY @ covY
     # scores = torch.linalg.norm(covX_inv_CovXY_covY_inv, ord='fro', dim=(-2, -1)) ** 2
 
-    # Unstable but fast in backward pass  !!!!
-    cov_xy_flat = covXY[idx_i, idx_j]
-    covX_inv_CovXY = torch.einsum("ab,tbc->tac", torch.linalg.pinv(covX, hermitian=True),  cov_xy_flat)  # covX.pinv() @ covXY
-    covX_inv_CovXY_covY_inv = torch.einsum("tac,cd->tad", covX_inv_CovXY, torch.linalg.pinv(covY, hermitian=True))  # covX.pinv() @ covXY @ covY
-    scores = torch.linalg.norm(covX_inv_CovXY_covY_inv, ord='fro', dim=(-2, -1)) ** 2
-
     # Stable but freaking slow in backward pass  !!!!
-    # scores = correlation_score(cov_x=covX.expand(len(idx_i), -1, -1),
-    #                            cov_y=covY.expand(len(idx_i), -1, -1),
-    #                            cov_xy=covXY[idx_i, idx_j])
+    scores = correlation_score(cov_x=covX.expand(time_horizon, -1, -1),
+                               cov_y=covY.expand(time_horizon, -1, -1),
+                               cov_xy=covYXdt)
 
     if run_checks:  # Check vectorized operations are equivalent to sequential operations
-        for i, j, score_ij in zip(idx_i, idx_j, scores):
-            cov_xi_yj = covXY[i, j]
-            exp = score_ij
-            real = correlation_score(cov_x=covX, cov_y=covY, cov_xy=cov_xi_yj)
-            # Least squares introduces some numerical instability, so we allow for a small tolerance
-            rel_error = torch.abs(exp - real) / real
-            assert rel_error <= 1e-1, \
-                f"Relative error between vectorized and sequential computation of correlation is {rel_error}"
+        for idx in range(len(scores)):
+            dt = idx + 1
+            exp = scores[idx]
+            real = correlation_score(cov_x=covX, cov_y=covY, cov_xy=covYXdt[dt - 1])
+            rel_error = torch.abs(exp - real) / torch.abs(real)
+            assert rel_error <= 0.1, f"Correlation scores do not match {exp}!={real}"
 
     return scores.mean()
 

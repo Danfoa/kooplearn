@@ -18,7 +18,7 @@ from kooplearn.models.ae.utils import flatten_context_data, multi_matrix_power, 
 from kooplearn.utils import ModesInfo
 from torch.utils.data import DataLoader
 
-logger = logging.getLogger("kooplearn")
+logger = logging.getLogger(__name__)
 
 
 class LatentBaseModel(kooplearn.abc.BaseModel, torch.nn.Module, ABC):
@@ -512,15 +512,15 @@ class LatentBaseModel(kooplearn.abc.BaseModel, torch.nn.Module, ABC):
         return restored_obj
 
     @torch.no_grad()
-    def fit_linear_decoder(self, latent_states: torch.Tensor, states: torch.Tensor) -> torch.nn.Module:
+    def fit_linear_decoder(self, latent_states: torch.Tensor, states: torch.Tensor, bias: bool=False) -> torch.nn.Module:
         """Fit a linear decoder mapping the latent state space Z to the state space X. use for mode decomp."""
 
         logger.info(f"Fitting linear decoder for {self.__class__.__name__} model")
-        use_bias = False  # TODO: Unsure if to enable. This can be another hyperparameter, or set to true by default.
+        bias = False  # TODO: Unsure if to enable. This can be another hyperparameter, or set to true by default.
 
         # Solve the least squares problem to find the linear decoder matrix and bias
         from kooplearn._src.linalg import full_rank_lstsq
-        D, bias = full_rank_lstsq(X=latent_states, Y=states, bias=use_bias)
+        D, B = full_rank_lstsq(X=latent_states, Y=states, bias=bias)
 
         # Check shape
         _expected_shape = (np.prod(self.state_features_shape), self.latent_dim)
@@ -530,12 +530,12 @@ class LatentBaseModel(kooplearn.abc.BaseModel, torch.nn.Module, ABC):
         # Create a non-trainable linear layer to store the linear decoder matrix and bias term
         lin_decoder = torch.nn.Linear(in_features=self.latent_dim,
                                       out_features=np.prod(self.state_features_shape),
-                                      bias=use_bias)
+                                      bias=B)
         lin_decoder.weight.data = D
         lin_decoder.weight.requires_grad = False
 
-        if use_bias:
-            lin_decoder.bias.data = torch.tensor(bias, dtype=torch.float32)
+        if bias:
+            lin_decoder.bias.data = torch.tensor(B, dtype=torch.float32)
             lin_decoder.bias.requires_grad = False
 
         return lin_decoder

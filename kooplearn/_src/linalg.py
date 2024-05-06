@@ -309,13 +309,14 @@ def full_rank_equivariant_lstsq(X: torch.Tensor,
                                 Y: torch.Tensor,
                                 rep_X: Optional[Representation] = None,
                                 rep_Y: Optional[Representation] = None,
+                                group_average: bool = True,
                                 bias: bool = True) -> [torch.Tensor, Union[torch.Tensor, None]]:
     """ Compute the least squares solution of the linear system Y = A·X + B.
 
     If the representation is provided the empirical transfer operator is improved using the group average trick to
     enforce equivariance considering that:
                         rep_Y(g) y = A rep_X(g) x
-                    rep_Y(g) (A x) = A rep_X(g) x
+                    rep_Y(g) (A x) = A rep_X(g) x     | y = A x
                         rep_Y(g) A = A rep_X(g)
             rep_Y(g) A rep_X(g)^-1 = A                | forall g in G.
 
@@ -325,42 +326,106 @@ def full_rank_equivariant_lstsq(X: torch.Tensor,
         Y: (|y|, n_samples) Data matrix of the next states.
         rep_X: Map from group elements to matrices of shape (|x|,|x|) transforming x in X.
         rep_Y: Map from group elements to matrices of shape (|y|,|y|) transforming y in Y.
+        group_average: Whether to use the group average trick to enforce equivariance or to use data augmentation.
         bias: Whether to include a bias term in the linear model.
     Returns:
         A: (|y|, |x|) Least squares solution of the linear system `Y = A·X + B`.
         B: Bias vector of dimension (|y|, 1). Set to None if bias=False.
     """
 
-    A, B = full_rank_lstsq(X, Y, bias=bias)
+    if group_average:
+        raise NotImplementedError("Need to implement change of basis to isotypic basis on input and output and solve"
+                                  "the lstsq problem for each isotypic space independently")
+
     if rep_X is None or rep_Y is None:
-        return A, B
-    assert rep_Y.group == rep_X.group, "Representations must belong to the same group."
+        return full_rank_lstsq(X, Y, bias=bias)
+    else:
+        G = rep_X.group
+        assert rep_Y.group == G, "Representations must belong to the same group."
+        G_X, G_Y = [X], [Y]
+        for h in G.generators:
+            rep_X_g = torch.tensor(rep_X(h), dtype=X.dtype, device=X.device)
+            rep_Y_g = torch.tensor(rep_Y(h), dtype=X.dtype, device=X.device)
+            G_X.append(torch.einsum('ij,js->is', rep_X_g, X))
+            G_Y.append(torch.einsum('ij,js->is', rep_Y_g, Y))
+        G_X = torch.cat(G_X, dim=1)
+        G_Y = torch.cat(G_Y, dim=1)
+        return full_rank_lstsq(G_X, G_Y, bias=bias)
 
-    # Do the group average trick to enforce equivariance.
-    # This is equivalent to applying the group average trick on the singular vectors of the covariance matrices.
-    A_G = []
-    group = rep_X.group
-    elements = group.elements if not group.continuous else group.grid(type='rand', N=group._maximum_frequency)
-    for g in elements:
-        if g == group.identity:
-            A_g = A
-        else:
-            rep_X_g_inv = torch.from_numpy(rep_X(~g)).to(dtype=X.dtype, device=X.device)
-            rep_Y_g = torch.from_numpy(rep_Y(g)).to(dtype=X.dtype, device=X.device)
-            A_g = rep_Y_g @ A @ rep_X_g_inv
-        A_G.append(A_g)
-    A_G = torch.stack(A_G, dim=0)
-    A_G = torch.mean(A_G, dim=0)
+    # A, B = full_rank_lstsq(X, Y, bias=bias)
+    # if rep_X is None or rep_Y is None:
+    #     return A, B
+    # assert rep_Y.group == rep_X.group, "Representations must belong to the same group."
+    #
+    # # Do the group average trick to enforce equivariance.
+    # # This is equivalent to applying the group average trick on the singular vectors of the covariance matrices.
+    # A_G = []
+    # group = rep_X.group
+    # elements = group.elements if not group.continuous else group.grid(type='rand', N=group._maximum_frequency)
+    # for g in elements:
+    #     if g == group.identity:
+    #         A_g = A
+    #     else:
+    #         rep_X_g_inv = torch.from_numpy(rep_X(~g)).to(dtype=X.dtype, device=X.device)
+    #         rep_Y_g = torch.from_numpy(rep_Y(g)).to(dtype=X.dtype, device=X.device)
+    #         A_g = rep_Y_g @ A @ rep_X_g_inv
+    #     A_G.append(A_g)
+    # A_G = torch.stack(A_G, dim=0)
+    # A_G = torch.mean(A_G, dim=0)
+    #
+    # if bias:
+    #     # Bias can only be present in the dimension of the output space associated with the trivial representation of G.
+    #     B_G = torch.zeros_like(B)
+    #     dim = 0
+    #     for irrep_id in rep_Y.irreps:
+    #         irrep = group.irrep(*irrep_id if isinstance(irrep_id, tuple) else (irrep_id,))
+    #         if irrep == group.trivial_representation:
+    #             B_G[dim] = B[dim]
+    #         dim += irrep.size
+    #     return A_G.to(dtype=X.dtype, device=X.device), B_G.to(dtype=X.dtype, device=X.device)
+    # return A_G.to(dtype=X.dtype, device=X.device), None
 
-    if bias:
-        # Bias can only be present in the dimension of the output space associated with the trivial representation of G.
-        B_G = torch.zeros_like(B)
-        dim = 0
-        for irrep_id in rep_Y.irreps:
-            irrep = group.irrep(*irrep_id if isinstance(irrep_id, tuple) else (irrep_id,))
-            if irrep == group.trivial_representation:
-                B_G[dim] = B[dim]
-            dim += irrep.size
-        return A_G.to(dtype=X.dtype, device=X.device), B_G.to(dtype=X.dtype, device=X.device)
-    return A_G.to(dtype=X.dtype, device=X.device), None
 
+def batch_matrix_sqrt_inv(C, epsilon=None, run_checks=False):
+    """ Compute the inverse square root of a batch of matrices.
+    Args:
+        C: (batch, d, d) Tensor containing a batch of matrices to compute the inverse square root.
+        epsilon: (float) Small constant to add to the eigenvalues to avoid numerical instability.
+    Returns:
+        C_inv_sqrt: (batch, d, d) Tensor containing the inverse square root of the input matrices.
+    """
+    dim = C.shape[-1]
+    # Perform batched eigenvalue decomposition
+    eigenvalues, Q = torch.linalg.eigh(C)  # C = Q @ Lambda @ Q^T
+    cond_num = torch.abs(eigenvalues[:, -1] / eigenvalues[:, 0])
+    if epsilon is None:
+        epsilon = torch.finfo(eigenvalues.dtype).eps
+
+    Lambda_inv_sqrt = 1.0 / torch.sqrt(eigenvalues)
+
+    # Perform batched matrix multiplication to compute C^(-1/2) = Q @ 1/sqrt(Lambda) @ Q^T
+    C_inv_sqrt = Q @ torch.diag_embed(Lambda_inv_sqrt) @ Q.mT
+
+    # Determine if some matrices are defective.
+    max_eigval = eigenvalues[:, -1]
+    relevant_eigvals_mask = eigenvalues > (max_eigval * epsilon).unsqueeze(-1)
+    ranks = relevant_eigvals_mask.sum(dim=-1)
+    defective_mask = ranks < dim
+    # Recompute defective matrix inversion and sqrt by ignoring defective eigenvalues and eigenvectors
+    if defective_mask.any():
+        # Eigvals are sorted in ascending order, so we can just remove the first `dim-rank` dimensions.
+        unique_def_ranks = torch.unique(ranks[defective_mask])
+        for rank in unique_def_ranks:
+            matrix_mask = defective_mask & (ranks == rank)  # Select defective matrices of rank `rank`
+            Q_low_rank = Q[matrix_mask, :, -rank:]  # Select the last `rank` eigenvectors
+            eig_low_rank = eigenvalues[matrix_mask, -rank:]  # Select the last `rank` eigenvalues
+            Lambda_inv_sqrt_low_rank = 1.0 / torch.sqrt(eig_low_rank)
+            C_inv_sqrt[matrix_mask] = Q_low_rank @ torch.diag_embed(Lambda_inv_sqrt_low_rank) @ Q_low_rank.mT
+
+    if run_checks:
+        C_inv_true = torch.linalg.pinv(C, hermitian=True)
+        C_inv_pred = C_inv_sqrt @ C_inv_sqrt
+        assert torch.allclose(C_inv_true, C_inv_pred, atol=1e-5), \
+            f"Matrix norm error {torch.linalg.matrix_norm(C_inv_true - C_inv_pred, ord='fro', dim=(-2, -1))}"
+
+    return C_inv_sqrt, cond_num

@@ -1,5 +1,9 @@
+from collections import namedtuple
+
 from escnn.group import Representation
 from kooplearn._src.check_deps import check_torch_deps
+from kooplearn._src.metrics import vectorized_correlation_scores, vectorized_spectral_scores
+from kooplearn.data import TensorContextDataset
 
 check_torch_deps()
 from typing import Optional  # noqa: E402
@@ -172,10 +176,9 @@ def extract_evolved_states(state_traj: torch.Tensor,
     return X, X_prime
 
 
-def vectorized_cross_cov(X_contexts: torch.Tensor,
-                         Y_contexts: Optional[torch.Tensor] = None,
-                         max_dts: Optional[int] = None,
-                         run_checks: bool = False) -> (torch.Tensor, torch.Tensor, torch.Tensor):
+def vectorized_cov_cross_cov(X_contexts: torch.Tensor,
+                             Y_contexts: Optional[torch.Tensor] = None,
+                             run_checks: bool = False) -> (torch.Tensor, torch.Tensor, torch.Tensor):
     """ Compute empirical estimations of the cross-covariance operators.
 
     This function takes data from two random variables X and Y in the form of a trajectory of states in context window
@@ -188,30 +191,24 @@ def vectorized_cross_cov(X_contexts: torch.Tensor,
     Args:
         X_contexts: (batch, time_horizon, |X|) trajectory of states of random variable X
         Y_contexts: (batch, time_horizon, |Y|) trajectory of states of random variable Y.
-        max_dts: (int) Maximum number of distinct time differences dt in [1, min(min(time_horizon-1, max_dts)]
-        considered to compute the cross-covariances. Default to `max_dts=time_horizon - 1`.
         run_checks: (bool) Run sanity checks to ensure the empirical estimates are correct. Default to False.
     Returns:
         CovYXdt: a tensor of shape (min(time_horizon-1, max_dts), |Y|, |X|) containing the Cross-Covariances
          per time difference dt. Such that CCov[dt-1] := Cov(y_i+dt, x_i) ∀ i dt in [0, time_horizon].
     """
     assert len(X_contexts.shape) == 3, f"state_traj: {X_contexts.shape}. Expected (batch, time_horizon, |X|)"
-    assert max_dts is None or isinstance(max_dts, int), f"max_dts: {max_dts}. Expected None or int."
 
     num_samples, time_horizon, _ = X_contexts.shape
-    dtype, device = X_contexts.dtype, X_contexts.device
-    pred_horizon = time_horizon - 1
-    max_dts = pred_horizon if max_dts is None else min(max_dts, pred_horizon)
 
     x_t = X_contexts[:, [0], :]  # (batch_size, 1, |X|)
-    y_t_dt = Y_contexts[:, 1:max_dts + 1, :]  # (batch_size, max_dts, |Y|)
+    y_t_dt = Y_contexts[:, 1:time_horizon, :]  # (batch_size, max_dts, |Y|)
 
     # Compute cross-covariance in single batched/parallel operation
     CovYXdt = torch.einsum('bty,box->tyx', y_t_dt, x_t) / num_samples
 
     if run_checks:  # Sanity checks. These should be true by construction
         from kooplearn.nn.functional import covariance
-        for dt in range(1, max_dts + 1):
+        for dt in range(1, time_horizon):
             x_0 = X_contexts[:, 0, :]
             y_dt = Y_contexts[:, dt, :]
             CovYXdt_true = covariance(X=x_0, Y=y_dt, center=False)
@@ -221,61 +218,63 @@ def vectorized_cross_cov(X_contexts: torch.Tensor,
     return CovYXdt
 
 
-def equivariant_vectorized_cross_cov(X_contexts: torch.Tensor,
-                                     rep_X: Representation,
-                                     Y_contexts: Optional[torch.Tensor] = None,
-                                     rep_Y: Optional[Representation] = None,
-                                     max_dts: Optional[int] = None,
-                                     run_checks: bool = False) -> (torch.Tensor, torch.Tensor, torch.Tensor):
-    """ Compute empirical equivariant estimations of the cross-covariance operators.
+def latent_space_metrics(
+        Z_contexts: TensorContextDataset,
+        Z_prime_contexts: TensorContextDataset,
+        center_covariances: bool = False,
+        G_rep_Z: Optional[torch.Tensor] = None,
+        grad_correlation_score=True,
+        grad_relaxed_score=True,
+        run_checks=False):
+    batch, time_horizon, latent_state_dim = Z_contexts.data.shape
+    n_samples = batch * time_horizon
 
-    This function takes data from two random variables X and Y in the form of a trajectory of states in context window
-    shape (n_samples, time_horizon, state_dim) there x_t, y_t are the states at time t in [0, time_horizon].
+    if center_covariances:
+        Z = Z_contexts.data - torch.mean(Z_contexts.data, dim=(0, 1))
+        Z_prime = Z_prime_contexts.data - torch.mean(Z_prime_contexts.data, dim=(0, 1))
+    else:
+        Z, Z_prime = Z_contexts.data, Z_prime_contexts.data
+    # Since we assume time homogenous dynamics, the CovX and CovY are "time-independent" so we compute them
+    # using the `n=batch * time_horizon` samples, to get better empirical estimates.
+    covZ = torch.einsum("btx,bty->xy", Z, Z) / n_samples
+    covZp = torch.einsum("btx,bty->xy", Z_prime, Z_prime) / n_samples
 
-    It computes the equivariant cross covariance operators CovXYdt := Cov(x_i, y_i+dt) for all dt in [1, time_horizon],
-    such that, `rep_Y(g) CovXYdt[k] = CovXYdt[k] rep_X(g)` for all g in G and k in [1, time_horizon]. This is achieved
-    by first computing the empirical cross-covariance operators CovXYdt and then applying the group-average trick to
-    improve the estimate by forcing it to be equivariant. For details see: "Group symmetry and covariance
-    regularization" at https://people.lids.mit.edu/pari/group_symm.pdf Section 2.3. Basically, we improve the empirical
-    estimate by applying:
+    covZpZdt = vectorized_cov_cross_cov(
+        X_contexts=Z[:, :-1, :],
+        Y_contexts=Z_prime[:, 1:, :],
+        run_checks=run_checks)
 
-    # CovYXdt = Cov(y_i+dt, x_i) in R^{|Y|x|X|}. That is CovYXdt: X -> Y
-    CovYXdt := 1/|G| Σ_g ∈ G (ρ_Y(g) Cov(Y, X) ρ_X(g)^T
+    if G_rep_Z is not None:  # Apply equivariant constraints to the empirical estimates by group averaging.
+        assert G_rep_Z.ndim == 3, f"G_rep_Z: {G_rep_Z.shape}. Expected (|H|, |Z|, |Z|)"
+        G_order = G_rep_Z.shape[0] + 1
+        G_rep_Z_inv = torch.permute(G_rep_Z, dims=(0, 2, 1))
+        # As identity e ∉ G.generators, we add the trivially transformed covariance matrix covX/covY/covYX to the sum.
+        covZ_equiv = (covZ + torch.einsum('Gya,ab,Gbx->yx', G_rep_Z, covZ, G_rep_Z_inv)) / G_order
+        covZp_equiv = (covZp + torch.einsum('Gya,ab,Gbx->yx', G_rep_Z, covZp, G_rep_Z_inv)) / G_order
+        covZpZdt_equiv = (covZpZdt + torch.einsum('Gya,tab,Gbx->tyx', G_rep_Z, covZpZdt, G_rep_Z_inv)) / G_order
+        # Update the covariance matrices with the equivariant constraints
+        covZ, covZp, covZpZdt = covZ_equiv, covZp_equiv, covZpZdt_equiv
 
-    Args:
-        X_contexts: (batch, time_horizon, |X|) trajectory of states of random variable X
-        Y_contexts: (batch, time_horizon, |Y|) trajectory of states of random variable Y.
-        max_dts: (int) Maximum number of distinct time differences dt in [1, min(min(time_horizon-1, max_dts)]
-        considered to compute the cross-covariances. Default to `max_dts=time_horizon - 1`.
-        run_checks: (bool) Run sanity checks to ensure the empirical estimates are correct. Default to False.
-    Returns:
-        CCov: a tensor of shape (min(time_horizon-1, max_dts), state_dim, state_dim) containing the Cross-Covariances
-         per time difference dt. Such that CCov[dt-1] := Cov(x_i, y_i+dt) ∀ i dt in [1, time_horizon-1].
-    """
-    CovYXdt = vectorized_cross_cov(X_contexts, Y_contexts, max_dts, run_checks)
+    # Compute both relaxed and un-relaxed scores, while computing gradients only for the selected score ============
+    with torch.set_grad_enabled(grad_relaxed_score):
+        # spectral_score[dt-1] := ||Cov(Z'_t+dt, Z_t)||^2_HS/(||Cov(Z')|| ||Cov(Z)|| | ∀ t, dt in [1, time_horizon]
+        spectral_scores = vectorized_spectral_scores(covYXdt=covZpZdt,
+                                                     covX=covZ,
+                                                     covY=covZp,
+                                                     run_checks=run_checks)
+    with torch.set_grad_enabled(grad_correlation_score):
+        # corr_score[dt-1] := ||Cov(Z')^1/2 Cov(Z'_t+dt, Z_t) Cov(Z)^1/2||^2_HS  | ∀ t, dt in [1, time_horizon]
+        corr_scores = vectorized_correlation_scores(covYXdt=covZpZdt,
+                                                    covX=covZ,  # illegal memory access if not clone
+                                                    covY=covZp,  # dunno wtf is happening here.
+                                                    run_checks=False)
 
-    G = rep_X.group
-    dtype, device = X_contexts.dtype, X_contexts.device
-    rep_X_inv_block = torch.cat([torch.tensor(rep_X(~h)) for h in G.generators], dim=0)  # (|G|, |X|, |X|)
-    rep_Y_block = torch.cat([torch.tensor(rep_Y(h)) for h in G.generators], dim=0)  # (|G|, |Y|, |Y|)
+    # Orthogonality regularization: || CovZZ - I || + || CovZ'Z' - I || ============================================
+    I = torch.eye(latent_state_dim, device=covZ.device)
+    orth_reg_Z = torch.linalg.norm(covZ - I, ord="fro")
+    orth_reg_Zp = torch.linalg.norm(covZp - I, ord="fro")
 
-    # Compute group average:  1/|G| Σ_g ∈ G (ρ_Y(g) Cov(Y, X) ρ_X(g)^T) in single batched/parallel operation.
-    # 'Gya,tab,Gbx->tyx' explains the operation ρ_Y(g) CovYXdt ρ_X(g)^T summed over g
-    CovYXdt_equiv = torch.einsum('Gya,tab,Gbx->tyx', rep_Y_block, CovYXdt, rep_X_inv_block) / G.order
-
-    if run_checks:  # Sanity checks. These should be true by construction
-        for dt in range(1, max_dts + 1):
-            CovYXdt = CovYXdt[dt - 1]
-            G_CovYXdt = [CovYXdt]
-            for h in G.generators:
-                rep_X_g_inv = torch.tensor(rep_X(~h)).to(device=device)
-                rep_X = torch.tensor(rep_Y(h)).to(device=device)
-                CovYXdt_g = torch.einsum('ab,bc,cd->ad', rep_X, CovYXdt, rep_X_g_inv)
-                G_CovYXdt.append(CovYXdt_g)
-            CovYXdt_true = torch.sum(torch.tensor(G_CovYXdt), dim=0) / G.order
-
-            assert torch.allclose(CovYXdt_equiv[dt - 1], CovYXdt_true, rtol=1e-5, atol=1e-5), \
-                f"Max error {torch.max(torch.abs(CovYXdt_equiv[dt - 1] - CovYXdt_true))}"
-
-    return CovYXdt_equiv
-
+    LatentSpaceMetrics = namedtuple(
+        typename='LatentSpaceMetrics',
+        field_names=['covZ', 'covZp', 'covZpZdt', 'spectral_scores', 'corr_scores', 'orth_reg_Z', 'orth_reg_Zp'])
+    return LatentSpaceMetrics(covZ, covZp, covZpZdt, spectral_scores, corr_scores, orth_reg_Z, orth_reg_Zp)

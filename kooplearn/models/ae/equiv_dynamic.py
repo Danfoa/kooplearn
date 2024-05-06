@@ -85,7 +85,10 @@ class EquivDynamicAE(DynamicAE):
 
     @wraps(DynamicAE.decode_contexts)  # Copies docstring from parent implementation
     def decode_contexts(
-            self, latent_obs: TensorContextDataset, decoder: torch.nn.Module, **kwargs
+            self,
+            latent_obs: TensorContextDataset,
+            decoder: torch.nn.Module,
+            **kwargs
             ) -> Union[dict, TensorContextDataset]:
         # Since an Equivariant decoder receives as input a escnn.nn.GeometricTensor, we need to:
         if isinstance(decoder, escnn.nn.EquivariantModule):
@@ -162,7 +165,7 @@ class EquivDynamicAE(DynamicAE):
 
     @wraps(DynamicAE.fit_linear_decoder)  # Copies docstring from parent implementation
     def fit_linear_decoder(self, latent_states: torch.Tensor, states: torch.Tensor):
-        use_bias = False  # TODO: Unsure if to enable. This can be another hyperparameter, or set to true by default.
+        use_bias = True
 
         D, bias = full_rank_equivariant_lstsq(X=latent_states,
                                               Y=states,

@@ -1,12 +1,7 @@
 import logging
-from typing import Optional
 
 import numpy as np
 import torch
-from escnn.group import Representation
-
-from kooplearn._src.linalg import batch_matrix_sqrt_inv
-from kooplearn.nn.functional import vectorized_cross_cov
 
 log = logging.getLogger(__name__)
 
@@ -158,86 +153,46 @@ def vectorized_correlation_scores(covYXdt: torch.Tensor,
             rel_error = torch.abs(exp - real) / torch.abs(real)
             assert rel_error <= 0.1, f"Correlation scores do not match {exp}!={real}"
 
-    return scores.mean()
+    return scores
 
+def chapman_kolmogorov_regularization(covYXdt: torch.Tensor, run_checks: bool = False):
+    """ Compute the Chapman-Kolmogorov regularization using the cross-covariance operators between distinct time steps.
 
-def obs_state_space_metrics(obs_state_traj: torch.Tensor,
-                            obs_state_traj_aux: Optional[torch.Tensor] = None,
-                            representation: Optional[Representation] = None,
-                            max_ck_window_length: int = 2):
-    """ Compute the metrics of an observable space with expected linear dynamics.
+    This regularization aims at exploitation Markov Assumption of a linear dynamical system. Specifically it computes:
+    ||Cov(y_t+dt, x_t) - (Cov(y_t+1, x_t) Cov(y_t+2, x_t+1) ... Cov(y_t+dt, x_t+dt-1))||_HS
+    ∀ t in [0, pred_horizon-2], and dt in [2, pred_horizon].
 
-    This function computes the metrics of an observable space with expected linear dynamics. Specifically,
+    This regularization aims at enforcing the semi-group property of the Markov process.
+
     Args:
-        obs_state_traj (batch, time_horizon, obs_state_dim): trajectory of states
-        obs_state_traj_aux (batch, time_horizon, obs_state_dim): Auxiliary trajectory of states
-        representation: Symmetry representation on the observable space. If provided, the empirical covariance and
-            cross-covariance operators will be improved using the group average trick
-        max_ck_window_length: Maximum window length to compute the Chapman-Kolmogorov regularization term.
-        ck_w: Weight of the Chapman-Kolmogorov regularization term.
+        covYXdt: (T, |Y|, |X|) Tensor containing all the Cross-Covariance
+         empirical operators two multivariate random variables X and Y. Such that CovYX(dt-1) = Cov(y_i+dt, x_i) for
+         all i in [0, time_horizon - dt], dt in [1, T].
+        run_checks: (bool) Whether to print debug information on the CK scores computed. Defaults to False.
     Returns:
-        Dictionary containing:
-        - spectral_score: (time_horizon - 1) Tensor containing the average spectral score between time steps
-        separated
-         apart by a shift of `dt` [steps/time]. That is:
-            spectral_score[dt - 1] = avg(||Cov(x_i, x'_i+dt)||_HS^2/(||Cov(x_i, x_i)||_2*||Cov(x'_i+dt, x'_i+dt)||_2))
-             | ∀ i in [0, time_horizon - dt], dt in [1, min(time_horizon - i, window_size)]
-        - corr_score: (time_horizon - 1) Tensor containing the correlation scores between time steps separated
-         apart by a shift of `dt` [steps/time]. That is:
-            corr_score[dt - 1] = avg(||Cov(x_i, x_i)^-1 Cov(x_i, x'_i+dt) Cov(x'_i+dt, x'_i+dt)^-1||_HS^2)
-             | ∀ i in [0, time_horizon - dt], dt in [1, min(time_horizon - i, window_size)]
-        - orth_reg: (time_horizon) Tensor containing the orthonormality regularization term for each time step.
-         That is: orth_reg[t] = || Cov(t,t) - I ||_2
-        - ck_reg: (time_horizon - 1,) Average CK error per `dt` time steps. That is:
-            ck_error[dt - 2] = avg(|| Cov(t, t+dt) - Cov(t, t+1) Cov(t+1, t+2) ... Cov(t+dt-1, t+dt) ||) |
-            ∀ t in [0, time_horizon - 2], dt in [2, min(time_horizon - 2, ck_window_length)]
-        - cov_cond_num: (float) Average condition number of the Covariance matrices.
+
     """
-    debug = log.level == logging.DEBUG  # TODO: remove default debug
-    # Compute the empirical covariance and cross-covariance operators, ensuring that operators are equivariant.
-    # CCov[i, j] := Cov(x_i, x'_j)     | i,j in [time_horizon], j > i  # Upper triangular tensor
-    # Cov[t] := Cov(x_t, x_t)          | t in [time_horizon]
-    # Cov_prime[t] := Cov(x'_t, x'_t)  | t in [time_horizon]
-    CCov, Cov, Cov_prime = vectorized_cov_cross_cov(X_contexts=obs_state_traj,
-                                                    Y_contexts=obs_state_traj_aux,
-                                                    cov_window_size=max_ck_window_length,
-                                                    representation=representation,
-                                                    run_checks=debug)
+    T, dimY, dimX = covYXdt.shape
+    assert covYXdt.ndim == 3 and dimX == covYXdt.shape[-1] and dimY == covYXdt.shape[-2], \
+        f"CovYXdt{covYXdt.shape}. Expected shape (T, |Y|, |X|)"
 
-    # Compute Cov(x_t)^-1/2 and Cov(x'_t)^-1/2 in a single parallel operation.
-    Cov_inv_sqrt, cond_num_Cov = batch_matrix_sqrt_inv(Cov, run_checks=debug)
-    Cov_prime_inv_sqrt, conv_num_Cov_prime = batch_matrix_sqrt_inv(Cov_prime, run_checks=debug)
 
-    # Orthonormality regularization terms for ALL time steps in horizon
-    # reg_orthonormal[t] = || Cov(x_i, x_i) - I || | t in [0, pred_horizon]
-    orthonormality_Cov = regularization_orthonormality(Cov)
-    orthonormality_Cov_prime = regularization_orthonormality(Cov_prime)
-    reg_orthonormal = (orthonormality_Cov + orthonormality_Cov_prime) / 2.0
+    # For efficiency (to avoid for loops), we compute the CK regularization only of powers of the original
+    # cross-covariance matrices per dt. Understanding that:
+    # Cov(y_i+2,x_i) = Cov(y_i+1, x_i)^2   < == > covYXdt[3] = covYXdt[0] @ covYXdt[0]
+    # Cov(y_i+4,x_i) = Cov(y_i+2, x_i)^2   < == > covYXdt[5] = covYXdt[1] @ covYXdt[1]
+    # Cov(y_i+6,x_i) = Cov(y_i+3, x_i)^2   < == > covYXdt[7] = covYXdt[2] @ covYXdt[2]
 
-    cond_num_Cov = torch.cat([cond_num_Cov, conv_num_Cov_prime], dim=0).mean()
 
-    # Compute the Correlation, Spectral and for ALL time steps in horizon.
-    # spectral_scores[dt - 1] := ||Cov(t, t+dt)||^2_HS / (||Cov(t)|| ||Cov(t+d)||) | dt in [1, time_horizon)
-    # corr_scores[dt - 1] := ||Cov(t)^-1 Cov(t, t+dt) Cov(t+d)^-1||^2_HS | dt in [1, time_horizon)
-    spectral_scores, corr_scores = vectorized_spectral_correlation_scores(CCov=CCov,
-                                                                          Cov=Cov, Cov_prime=Cov_prime,
-                                                                          Cov_sqrt_inv=Cov_inv_sqrt,
-                                                                          Cov_prime_sqrt_inv=Cov_prime_inv_sqrt,
-                                                                          run_checks=debug)
-    if debug:
-        assert (corr_scores > spectral_scores).all(), "Correlation scores should be upper bound of spectral scores"
+    max_dt = T if T % 2 == 0 else T - 1
+    covYXdt_squared = torch.einsum("tij,tjk->tik", covYXdt[:(max_dt // 2) + 1], covYXdt[:(max_dt // 2) + 1])
 
-    # Compute the Chapman-Kolmogorov regularization scores for all possible step transitions. In return, we get:
-    # ck_regularization[i,j] = || Cov(i, j) - ( Cov(i, i+1), ... Cov(j-1, j) ) ||_2  | j >= i + 2
-    ck_regularization = chapman_kolmogorov_regularization(CCov=CCov,  # Cov=Cov, Cov_prime=Cov_prime,
-                                                          ck_window_length=max_ck_window_length,
-                                                          debug=debug)
+    dt_idx = torch.arange(1, T//2 + 1, device=covYXdt.device)
+    target_idx_dt = 2 * (dt_idx)
 
-    return dict(orth_reg=reg_orthonormal,
-                ck_reg=ck_regularization,
-                spectral_score=spectral_scores,
-                corr_score=corr_scores,
-                cov_cond_num=cond_num_Cov,
-                # projection_score_t=torch.nanmean(projection_score_t, dim=0, keepdim=True),  # (batch, time)
-                # spectral_score_t=torch.nanmean(spectral_score_t, dim=0, keepdim=True)       # (batch, time)
-                )
+    # Cov(y_i+H*2, x_i) = Cov(y_i+H, x_i)^2 < == > covYXdt[2*H-1] = covYXdt[H-1] @ covYXdt[H-1]
+    CK_err = covYXdt[target_idx_dt - 1] - covYXdt_squared[dt_idx - 1]
+
+    CK_err_norm = torch.linalg.norm(CK_err, ord='fro', dim=(-2, -1))
+
+    return CK_err_norm

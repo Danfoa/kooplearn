@@ -51,10 +51,14 @@ full = [
 [tool.hatch.version]
 path = "kooplearn/__about__.py"
 
-[tool.isort]
-# make it compatible with black
-profile = "black"
+[tool.isort]          # TODO: Ruff already defines (customizable) rules for sorting imports.
+profile = "black"     # make it compatible with black
+line_length = 120
 
+[tool.black]
+line-length = 120     # TODO: We should transition to use ruff instead of black, as it is more flexible.
+                      #  You can format with ruff just as you can do with black.
+                      #  Main difference is that ruff is not a harsh format dictator.
 [tool.ruff]
 line-length = 120
 select = [
@@ -75,5 +79,5 @@ ignore = [
   "D100",
 ]
 
-#[tool.ruff.pydocstyle]
-#convention = "google"  TODO: ?? Should we enforce this ?? which convention are we selecting ??
+[tool.ruff.pydocstyle]
+convention = "google"  # TODO: ?? Should we enforce this ?? which convention are we selecting ??

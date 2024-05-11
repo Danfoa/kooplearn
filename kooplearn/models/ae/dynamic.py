@@ -11,7 +11,9 @@ from kooplearn._src.linalg import full_rank_lstsq
 from kooplearn.data import TensorContextDataset  # noqa: E402
 from kooplearn.models.ae.utils import flatten_context_data
 from kooplearn.models.base_model import LatentBaseModel, LightningLatentModel, _default_lighting_trainer
+from kooplearn.nn.functional import latent_space_metrics
 from kooplearn.utils import check_if_resume_experiment
+
 
 check_torch_deps()
 import lightning  # noqa: E402
@@ -69,7 +71,9 @@ class DynamicAE(LatentBaseModel):
                  loss_weights: Optional[dict] = None,
                  use_lstsq_for_evolution: bool = False,
                  evolution_op_bias: bool = False,
-                 evolution_op_init_mode: str = "stable"
+                 evolution_op_init_mode: str = "stable",
+                 center_latent_obs: bool = False,
+                 running_latent_obs_stats: bool = False,
                  ):
         super().__init__()  # Initialize torch.nn.Module
 
@@ -85,6 +89,8 @@ class DynamicAE(LatentBaseModel):
         # Hyperparameters of the learned/fitted evolution operator
         self.evolution_op_bias = evolution_op_bias
         self.use_lstsq_for_evolution = use_lstsq_for_evolution
+        self.center_latent_obs = center_latent_obs
+        self.running_latent_obs_stats = running_latent_obs_stats
 
         if use_lstsq_for_evolution:
             # self.linear_dynamics = torch.nn.Parameter(torch., requires_grad=False)
@@ -94,6 +100,11 @@ class DynamicAE(LatentBaseModel):
             # Adding a bias term is analog to enforcing the evolution operator to model the constant function.
             self.linear_dynamics = self.get_linear_dynamics_model(enforce_constant_fn=evolution_op_bias)
             self.initialize_evolution_operator(init_mode=evolution_op_init_mode)
+
+        if center_latent_obs:
+            self.obs_normalization_layer = self.get_latent_obs_normalization_layer()
+
+        self.state_dim = None
 
     def fit(
             self,
@@ -133,14 +144,14 @@ class DynamicAE(LatentBaseModel):
         self._check_dataloaders_and_shapes(datamodule, train_dataloaders, val_dataloaders)
 
         if self.loss_weights is None:  # Automatically set the loss weights if not provided
-            self.loss_weights = dict(rec=1.0, pred=1.0, lin=2.0)
+            self.loss_weights = dict(rec=1.0, pred=1.0, lin=1.0, orth=0.0)
 
         # Weight evenly a delta error in state space as a delta error in latent observable space
         # A λ error in each dimension of the state/observable space leads to a mean square error:
         # err_state = λ * sqrt(input_dim)       ---             err_latent = λ * sqrt(latent_dim)
         # To balance the errors, we need to weight the latent error by the ratio sqrt(input_dim / latent_dim)
-        input_dim = np.prod(self.state_features_shape)
-        obs_dim_state_dim_ratio = math.sqrt(input_dim / self.latent_dim)
+        self.state_dim = np.prod(self.state_features_shape)
+        obs_dim_state_dim_ratio = math.sqrt(self.state_dim / self.latent_dim)
         self.loss_weights["lin"] *= obs_dim_state_dim_ratio
 
         # Fit the encoder, decoder and (optionally) the evolution operator =============================================
@@ -195,6 +206,9 @@ class DynamicAE(LatentBaseModel):
 
         # After fitted, additionally compute the predictions using the linear decoder.
         if self.is_fitted and self.lin_decoder is not None:
+            # If self.decoder and self.lin_decoder point at the same object, we don't need to compute the predictions.
+            if self.decoder is self.lin_decoder:
+                return output
             pred_latent_obs = output["pred_latent_obs"]
             pred_state_lin_decoded = self.decode_contexts(latent_obs=pred_latent_obs, decoder=self.lin_decoder)
             output["pred_state_lin_decoded"] = pred_state_lin_decoded
@@ -256,32 +270,60 @@ class DynamicAE(LatentBaseModel):
         alpha_rec = self.loss_weights["rec"]
         alpha_pred = self.loss_weights["pred"]
         alpha_lin = self.loss_weights["lin"]
+        alpha_orth = self.loss_weights["orth"]
+        metrics = dict()
 
         MSE = torch.nn.MSELoss()
+        # Compute reconstruction error of the entire state trajectory not only of initial state. =======================
+        rec_state = self.decode_contexts(latent_obs=latent_obs, decoder=self.decoder)
         # Reconstruction + prediction loss
-        rec_loss = MSE(state.lookback(lookback_len), pred_state.lookback(lookback_len))
+        rec_loss = MSE(state.data, rec_state.data)
+        # Compute the prediction loss ==================================================================================
         pred_loss = MSE(state.lookforward(lookback_len), pred_state.lookforward(lookback_len))
 
-        metrics = dict(reconstruction_loss=rec_loss.item(), prediction_loss=pred_loss.item())
+        loss = alpha_rec * rec_loss + alpha_pred * pred_loss
 
         if pred_state_lin_decoded is not None:  # If predictions are computed with linear decoder compute metrics.
             rec_lin_loss = MSE(state.lookback(lookback_len), pred_state_lin_decoded.lookback(lookback_len))
             pred_lin_loss = MSE(state.lookforward(lookback_len), pred_state_lin_decoded.lookforward(lookback_len))
-            metrics["reconstruction_lin_dec_loss"] = rec_lin_loss.item()
-            metrics["prediction_lin_dec_loss"] = pred_lin_loss.item()
-
-        loss = alpha_rec * rec_loss + alpha_pred * pred_loss
+            metrics.update(rec_lin_loss=rec_lin_loss.item(), pred_lin_loss=pred_lin_loss.item())
 
         if self.use_lstsq_for_evolution:
             pass
         else:
             lin_loss = MSE(latent_obs.data, pred_latent_obs.data)
             loss += alpha_lin * lin_loss
-
             metrics["linear_dynamics_loss"] = lin_loss.item()
+
+        # Compute orthogonality regularization of the latent space =====================================================
+        orth_loss_with_grad = self.loss_weights["orth"] > 0.0
+        orth_loss, space_metrics = self.get_latent_space_orth_metrics(latent_obs, with_grad=orth_loss_with_grad)
+
+        loss = loss + (alpha_orth * (self.state_dim / self.latent_dim) * orth_loss) if orth_loss_with_grad else loss
+
+        metrics.update(space_metrics, orth_reg=orth_loss.item(), rec_loss=rec_loss.item(), pred_loss=pred_loss.item())
 
         metrics["loss"] = loss
         return metrics
+
+    def get_latent_space_orth_metrics(self, latent_obs, with_grad: bool = False):
+        metrics = dict()
+        with torch.set_grad_enabled(with_grad):
+            Z = latent_obs.data
+            batch, time_horizon, latent_state_dim = Z.shape
+            n_samples = batch * time_horizon
+            covZ = torch.einsum("btx,bty->xy", Z, Z) / n_samples
+            I = torch.eye(latent_state_dim, device=covZ.device)
+            orth_reg_Z = torch.linalg.norm(covZ - I, ord="fro")
+        with torch.no_grad():
+            eigvals_Z = torch.linalg.eigvalsh(covZ)
+            eps = 5 * torch.finfo(eigvals_Z.dtype).eps
+            eig_max_X, eig_min_X = eigvals_Z.max(), eigvals_Z.min()
+            metrics.update(orth_reg=orth_reg_Z.item(),
+                           rank_Z=torch.sum(eigvals_Z > torch.max(eigvals_Z) * eps).item() / self.latent_dim,
+                           cond_Z=(torch.abs(eig_max_X) / torch.abs(eig_min_X)).item())
+            metrics.update({"covZ/norm": eig_max_X.item(), "covZ/sval_min": eig_min_X.item()})
+        return orth_reg_Z, metrics
 
     def get_linear_dynamics_model(self, enforce_constant_fn: bool = False) -> torch.nn.Module:
         if enforce_constant_fn:
@@ -351,6 +393,9 @@ class DynamicAE(LatentBaseModel):
                 return
             logger.info(f"Trainable evolution operator initialized with mode {init_mode}")
 
+    def get_latent_obs_normalization_layer(self):
+        return torch.nn.BatchNorm1d(self.latent_dim, affine=False, track_running_stats=self.running_latent_obs_stats)
+
     @property
     def evolution_operator(self):
         if self.use_lstsq_for_evolution:
@@ -369,5 +414,3 @@ class DynamicAE(LatentBaseModel):
         # else:
         #     return self.trainer.state.finished
         return self._is_fitted
-
-

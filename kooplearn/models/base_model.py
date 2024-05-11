@@ -178,8 +178,7 @@ class LatentBaseModel(kooplearn.abc.BaseModel, torch.nn.Module, ABC):
         flat_decoded_contexts = decoder(flatten_context_data(latent_obs))
         # From (batch * context_length, *features_shape) to (batch, context_length, *features_shape)
         decoded_contexts = unflatten_context_data(flat_decoded_contexts,
-                                                  batch_size=len(latent_obs),
-                                                  features_shape=self.state_features_shape)
+                                                  batch_size=len(latent_obs))
         return decoded_contexts
 
     def evolve_contexts(self, latent_obs: TensorContextDataset, **kwargs) -> Union[dict, TensorContextDataset]:
@@ -206,7 +205,7 @@ class LatentBaseModel(kooplearn.abc.BaseModel, torch.nn.Module, ABC):
         context_length = latent_obs.context_length
 
         # Initial condition to evolve in time.
-        z_0 = latent_obs.lookback(self.lookback_len).squeeze()
+        z_0 = latent_obs.lookback(self.lookback_len).squeeze(dim=1)  # Remove time dimension.
 
         if self.is_fitted:
             if not hasattr(self, "_eigvals"): self.eig()  # Ensure eigendecomposition is in cache
@@ -220,7 +219,12 @@ class LatentBaseModel(kooplearn.abc.BaseModel, torch.nn.Module, ABC):
             # Compute z_t_eigbasis[batch, t] = Λ^t V^-1 z_0 | t in [0, context_length]
             z_t_eigbasis = torch.einsum("to,...o->...to", powered_eigvals, z_0_eigbasis)
             # Convert back to the original basis z_t[batch,t] = V Λ^t V^-1 z_0 | t in [0, context_length]
-            z_t = torch.einsum("oi,...ti->...to", eigvecs_r.data, z_t_eigbasis).real.to(dtype=z_0.dtype)
+            z_t = torch.einsum(
+                "oi,...ti->...to",
+                eigvecs_r.data.to(dtype=z_t_eigbasis.dtype),
+                z_t_eigbasis
+                ).real.to(dtype=z_0.dtype)
+            print("")
         else:
             # T : (latent_dim, latent_dim)
             evolution_operator = self.evolution_operator
@@ -510,11 +514,11 @@ class LatentBaseModel(kooplearn.abc.BaseModel, torch.nn.Module, ABC):
         return restored_obj
 
     @torch.no_grad()
-    def fit_linear_decoder(self, latent_states: torch.Tensor, states: torch.Tensor) -> torch.nn.Module:
+    def fit_linear_decoder(self, latent_states: torch.Tensor, states: torch.Tensor,
+                           bias: bool = False) -> torch.nn.Module:
         """Fit a linear decoder mapping the latent state space Z to the state space X. use for mode decomp."""
 
         logger.info(f"Fitting linear decoder for {self.__class__.__name__} model")
-        use_bias = False  # TODO: Unsure if to enable. This can be another hyperparameter, or set to true by default.
 
         # Solve the least squares problem to find the linear decoder matrix and bias
         from kooplearn._src.linalg import full_rank_lstsq

@@ -29,7 +29,9 @@ class EquivDynamicAE(DynamicAE):
                  loss_weights: Optional[dict] = None,
                  use_lstsq_for_evolution: bool = False,
                  evolution_op_bias: bool = False,
-                 evolution_op_init_mode: str = "stable"
+                 evolution_op_init_mode: str = "stable",
+                 center_latent_obs: bool = False,
+                 running_latent_obs_stats: bool = False
                  ):
         assert 'out_type' not in encoder_kwargs.keys() and 'in_type' not in decoder_kwargs.keys(), \
             f"Encoder `out_type` (and decoder `in_type`) is automatically defined by {self.__class__.__name__}."
@@ -63,7 +65,9 @@ class EquivDynamicAE(DynamicAE):
                                              loss_weights=loss_weights,
                                              evolution_op_bias=evolution_op_bias,
                                              evolution_op_init_mode=evolution_op_init_mode,
-                                             use_lstsq_for_evolution=use_lstsq_for_evolution)
+                                             use_lstsq_for_evolution=use_lstsq_for_evolution,
+                                             center_latent_obs=center_latent_obs,
+                                             running_latent_obs_stats=running_latent_obs_stats)
 
         # If the user passed a trainable Linear layer as decoder, use this for mode decomposition.
         if isinstance(self.decoder, escnn.nn.Linear):
@@ -77,10 +81,15 @@ class EquivDynamicAE(DynamicAE):
         encoder = self.encoder
         # From (batch, context_length, *features_shape) to (batch * context_length, *features_shape)
         flat_encoded_contexts = encoder(self.state_type(flatten_context_data(state)))
+        # Perform centering of the latent observable functions if required
+        if self.center_latent_obs:
+            raise NotImplementedError()
+            a = flat_encoded_contexts.tensor.mean(dim=0)
+            flat_encoded_contexts.data = flat_encoded_contexts.tensor - flat_encoded_contexts.tensor.mean(dim=0)
+
         # From (batch * context_length, latent_dim) to (batch, context_length, latent_dim)
         latent_obs_contexts = unflatten_context_data(flat_encoded_contexts.tensor,
-                                                     batch_size=len(state),
-                                                     features_shape=(self.latent_dim,))
+                                                     batch_size=len(state))
         return latent_obs_contexts
 
     @wraps(DynamicAE.decode_contexts)  # Copies docstring from parent implementation
@@ -93,8 +102,7 @@ class EquivDynamicAE(DynamicAE):
             flat_decoded_contexts = decoder(self.latent_state_type(flatten_context_data(latent_obs)))
             # From  GeometricTensor(batch * context_length, *features_shape) to (batch, context_length, *features_shape)
             decoded_contexts = unflatten_context_data(flat_decoded_contexts.tensor,
-                                                      batch_size=len(latent_obs),
-                                                      features_shape=self.state_features_shape)
+                                                      batch_size=len(latent_obs))
         else:
             decoded_contexts = super(EquivDynamicAE, self).decode_contexts(latent_obs, decoder, **kwargs)
 
@@ -141,6 +149,7 @@ class EquivDynamicAE(DynamicAE):
             eigvecs_l = scipy.linalg.block_diag(*eigvecs_l_iso)
             eigvecs_l_inv = np.linalg.inv(eigvecs_l)
 
+
             # Check the eigendecomposition is correct. Fails for non-diagonalizable matrices.
             # T_rec = eigvecs_r @ np.diag(eigvals) @ np.linalg.inv(eigvecs_r)
             # assert np.allclose(T_np, T_rec, rtol=1e-5, atol=1e-5)
@@ -153,6 +162,32 @@ class EquivDynamicAE(DynamicAE):
 
         # Having computed the eigendecomposition using the block-diagonal structure, default to parent implementation
         return super(EquivDynamicAE, self).eig(eval_left_on, eval_right_on)
+
+    @wraps(DynamicAE.get_latent_space_orth_metrics)  # Copies docstring from parent implementation
+    def get_latent_space_orth_metrics(self, latent_obs, with_grad: bool = False):
+        # Compute the orthogonal regularization term for the latent space
+        orth_reg, iso_metrics = [], []
+        for irrep_id, iso_rep in self.latent_iso_reps.items():
+            iso_dims = list(self.latent_iso_dims[irrep_id])
+            dim_s, dim_e = min(iso_dims), max(iso_dims) + 1
+
+            iso_orth_reg, metrics = super(EquivDynamicAE, self).get_latent_space_orth_metrics(
+                latent_obs[..., dim_s:dim_e], with_grad=with_grad
+                )
+            orth_reg.append(iso_orth_reg)
+            iso_metrics.append(metrics)
+
+        # Compute the orthonormal regularization score from the isotypic subspaces
+        orth_reg_Z = torch.sqrt(torch.sum(torch.vstack(orth_reg) ** 2, dim=0))
+
+        metrics = dict()
+        with torch.no_grad():
+            rank_Ziso = [m['rank_Z'] for m in iso_metrics]
+            cond_Ziso = [m['cond_Z'] for m in iso_metrics]
+            metrics.update({f"condZ/iso{i}": cond_Ziso[i] for i in range(len(cond_Ziso))})
+            metrics.update({f"rankZ/iso{i}": rank_Ziso[i] for i in range(len(rank_Ziso))})
+
+        return orth_reg_Z, metrics
 
     @wraps(DynamicAE.get_linear_dynamics_model)  # Copies docstring from parent implementation
     def get_linear_dynamics_model(self, enforce_constant_fn: bool = False) -> torch.nn.Module:
@@ -224,7 +259,7 @@ class EquivDynamicAE(DynamicAE):
                 # Add small perturbation to the off-diagonal elements
                 coefficients = 0.001 * torch.randn((basis_dimension,))
                 # coefficients = torch.zeros((basis_dimension,))
-                coefficients[singlar_value_dimensions] = 1
+                coefficients[singlar_value_dimensions] = 0.9995
 
                 # retrieve the linear coefficients for the basis expansion
                 identity_coefficients[start_coeff:end_coeff] = coefficients
@@ -255,3 +290,8 @@ class EquivDynamicAE(DynamicAE):
             if bias is not None:
                 return matrix, bias
             return matrix
+
+    def get_latent_obs_normalization_layer(self):
+        return escnn.nn.IIDBatchNorm1d(
+            in_type=self.latent_state_type, affine=False, track_running_stats=self.running_latent_obs_stats
+            )

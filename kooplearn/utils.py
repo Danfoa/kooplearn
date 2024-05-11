@@ -3,8 +3,9 @@ from dataclasses import dataclass
 from typing import Optional, Union
 
 import numpy as np
-import torch.nn
+import pandas as pd
 from lightning.pytorch.callbacks import ModelCheckpoint
+from plotly.graph_objs import Figure
 
 
 def check_if_resume_experiment(ckpt_call: Optional[ModelCheckpoint] = None):
@@ -34,11 +35,11 @@ def check_if_resume_experiment(ckpt_call: Optional[ModelCheckpoint] = None):
     best_path = pathlib.Path(ckpt_call.dirpath).joinpath(ckpt_call.filename + ckpt_call.FILE_EXTENSION)
 
     if best_path.exists():
-        return True, None, best_path
+        return True, ckpt_path, best_path
     elif ckpt_path.exists():
-        return False, ckpt_path, None
+        return False, ckpt_path, best_path
     else:
-        return False, None, None
+        return False, ckpt_path, best_path
 
 
 @dataclass
@@ -72,20 +73,24 @@ class ModesInfo:
     eigvals: np.ndarray
     eigvecs_r: np.ndarray
     state_eigenbasis: np.ndarray
-    linear_decoder: Optional[Union[np.ndarray, torch.nn.Linear]] = None
+    linear_decoder: Optional[Union[np.ndarray, any]] = None
     sort_by: str = "modulus"
-
+    
+    plotly_template: str = "plotly_dark"
+    
     def __post_init__(self):
         """Identifies real and complex conjugate pairs of eigenvectors, along with their associated dimensions
 
         Assuming `z_k ∈ R^l` is real-valued, we will not obtain l modes, considering that for any eigenvector v_i
-        associated with a complex eigenvalue λ_i ∈ C will have corresponding eigenpair (v_i^*, λ_i^*).
-        Sort and cluster the eigenvalues by magnitude and field (real, complex)
+        associated with a complex eigenvalue λ_i ∈ C will have corresponding conjugate eigenpair (v_i^*, λ_i^*).
+        Sort and cluster the eigenvalues by the chosen sorting metric.
         """
         # Sort and cluster the eigenvalues by magnitude and field (real, complex) ======================================
         from kooplearn._src.utils import parse_cplx_eig
+        # Keep memory of the original number of modes/eigenvalues
+        self._n_original_modes = len(self.eigvals)
+
         real_eigs, cplx_eigs, real_eigs_indices, cplx_eigs_indices = parse_cplx_eig(self.eigvals)
-        self._state_dim = self.state_eigenbasis.shape[-1]
 
         if self.sort_by == "modulus":
             real_eigs_modulus = np.abs(real_eigs)
@@ -131,7 +136,7 @@ class ModesInfo:
         # we compute the predicted state_eigenbasis by applying the linear dynamics of each eigenspace to the
         # initial state_eigenbasis a.k.a the eigenfunctions evaluated at time 0.
         context_window = self.state_eigenbasis.shape[-2]
-        eigfn_0 = self.state_eigenbasis[..., 0,:]
+        eigfn_0 = self.state_eigenbasis[..., 0, :]
         eigval_t = np.asarray([self.eigvals ** t for t in range(context_window)])  # λ_i^t for t in [0,time_horizon)
         eigfn_pred = np.einsum("...l,tl->...tl", eigfn_0, eigval_t)  # (...,context_window, l)
         assert self.state_eigenbasis.shape == eigfn_pred.shape
@@ -147,6 +152,22 @@ class ModesInfo:
             _real_eigval_modes = self.cplx_modes[..., np.logical_not(self.is_complex_mode), :]
             assert np.allclose(_real_eigval_modes.imag, 0, rtol=1e-5, atol=1e-5), \
                 f"Real modes have non-zero imaginary part: {np.max(_real_eigval_modes.imag)}"
+
+        # Store all values in a dataframe useful for plotting and visualization =======================================
+        self._data_df = pd.DataFrame({
+            "modes_sorted_idx":     range(self.n_modes),
+            "modes_original_idx":   self._sorted_eigs_indices,
+            "modes_frequencies":    self.modes_frequency,
+            "modes_modulus":        self.modes_modulus,
+            "modes_decay_rate":     self.modes_decay_rate,
+            "modes_transient_time": self.modes_transient_time,
+            "eigvals_re":            self.eigvals.real,
+            "eigvals_im":            self.eigvals.imag,
+            "is_complex_mode":       self.is_complex_mode,
+            })
+
+        self._modes_vs_time_fig = None
+        self._eigval_metrics_fig = None
 
     @property
     def n_modes(self):
@@ -172,9 +193,27 @@ class ModesInfo:
         real_modes = self.cplx_modes_pred.real
         real_modes[..., self.is_complex_mode, :] *= 2
         if self.linear_decoder is not None:
+            import escnn
+            import torch
             if isinstance(self.linear_decoder, torch.nn.Linear):
                 device, dtype = self.linear_decoder.weight.device, self.linear_decoder.weight.dtype
-                real_modes = self.linear_decoder(torch.tensor(real_modes, device=device, dtype=dtype)).detach().numpy()
+                real_modes = self.linear_decoder(
+                    torch.tensor(real_modes, device=device, dtype=dtype)
+                    ).detach().cpu().numpy()
+            elif isinstance(self.linear_decoder, escnn.nn.Linear):  # in case of equivariant linear decoder
+                matrix, _ = self.linear_decoder.expand_parameters()
+                device, dtype, in_type = matrix.device, matrix.dtype, self.linear_decoder.in_type
+                initial_shape = real_modes.shape  # (n_trajs, context_window, N_u, l)
+                output_shape = initial_shape[:-1] + (self.linear_decoder.out_type.size,)
+                # Use contiguous to avoid shuffling dims on reshape
+                modes = torch.tensor(real_modes, device=device, dtype=dtype).contiguous()
+                # Equiv linear layer is expecting a GeometricTensor instance of shape (n_samples, l)
+                modes_flat = torch.reshape(modes, (-1, initial_shape[-1]))
+                modes_flat_typed = in_type(modes_flat)
+                real_modes_typed = self.linear_decoder(modes_flat_typed)
+                # Reshape to (n_trajs, context_window, N_u, o)
+                real_modes_orig_shape = torch.reshape(real_modes_typed.tensor, output_shape)
+                real_modes = real_modes_orig_shape.detach().cpu().numpy()
             elif isinstance(self.linear_decoder, np.ndarray):
                 real_modes = np.einsum("ol,...l->...o", self.linear_decoder, real_modes)
             else:
@@ -233,7 +272,12 @@ class ModesInfo:
         decay_rates = self.modes_decay_rate
         return 1 / decay_rates * np.log(90. / 100.)
 
-    def plot_eigfn_dynamics(self, mode_indices: Optional[list[int]] = None):
+    def plot_eigfn_dynamics(
+            self,
+            eigfn: Optional[np.ndarray] = None,
+            selected_mode_idx: Optional[list[int]] = None,
+            replot: bool = False,
+            ):
         """ Create plotly (n_modes) x 2 subplots to show the eigenfunctions dynamics.
 
         The first column will plot the eigenfunctions in the complex plane, while the second column will plot the
@@ -241,115 +285,304 @@ class ModesInfo:
         if the decay rate is positive.
 
         Args:
-            mode_indices:
+            eigfn (np.ndarray): Array of shape (context_window, N) or (N,) containing a trajectory of evaluated
+                eigenfunctions at each time step or a single initial time-frame of eigenfunctions, respectively.
+            selected_mode_idx: Modes to enable in the visualization. If None, all modes will be enabled.
 
         Returns:
         """
         import plotly.graph_objects as go
         from plotly.subplots import make_subplots
 
-        if mode_indices is None:
-            mode_indices = range(self.n_modes)
-        n_modes_to_show = len(mode_indices)
+        true_eigfn_color = "red"
 
-        # Fix plot visual parameters ====================================================================================
-        width = 200
-        fig_width = 3 * width  # Assuming the second column and margins approximately take up another 400 pixels.
-        fig_height = width * n_modes_to_show
-        vertical_spacing = width * 0.1 / fig_height
+        if eigfn is not None:
+            assert eigfn.shape[-1] == self._n_original_modes, \
+                f"Expected eigenfunctions of shape (..., {self._n_original_modes}), got {eigfn.shape}."
+            assert eigfn.ndim <= 2, \
+                f"Expected eigenfunctions of shape (context_window_length, n_modes) or (n_modes,), got {eigfn.shape}."
+            if eigfn.ndim == 1:  # Expand axis if only the eigenfunctions at time 0 are given. (n_modes,) -> (1,
+                # n_modes)
+                eigfn = eigfn[np.newaxis, :]
+                gt_sorted_eigfn = None
+            else:
+                gt_sorted_eigfn = eigfn[..., self._sorted_eigs_indices]  # Sort the eigenfunctions
+        else:
+            eigfn = self.state_eigenbasis[0]
+            gt_sorted_eigfn = eigfn  # Sort the eigenfunctions
 
-        # Compute the required data for plotting the eigenfunction dynamics ===========================================
-        eigfn = self.state_eigenbasis[0]  # (time_horizon, modes)
-        eigfn_pred = self.pred_state_eigenbasis[0]  # (time_horizon, modes)
-        time_horizon = eigfn.shape[0]
-        eigval_traj = np.asarray([self.eigvals ** t for t in range(time_horizon)])  # λ_i^t for t in [0,time_horizon)
+        context_window_length, n_modes = eigfn.shape
+        selected_mode_idx = np.ones_like(self.eigvals, dtype=bool) if selected_mode_idx is None else selected_mode_idx
 
-        time = np.linspace(0, time_horizon * self.dt, time_horizon)
+        if self._modes_vs_time_fig is None or replot:
+            # Fix plot visual parameters
+            # ====================================================================================
+            width = 150
+            fig_width = 3 * width  # Assuming the second column and margins approximately take up another 400 pixels.
+            fig_height = width * self.n_modes
+            vertical_spacing = width * 0.25 / fig_height
 
-        fig = make_subplots(rows=self.n_modes, cols=2, column_widths=[0.33, 0.66],
-                            subplot_titles=[f"Mode {i // 2}" for i in range(2 * n_modes_to_show)],
-                            # vertical_spacing=vertical_spacing,
-                            shared_xaxes=True,
-                            # shared_yaxes='rows'
-                            )
+            time = np.linspace(0, context_window_length * self.dt, context_window_length)
 
-        time_normalized = time / (time_horizon * self.dt)
-        COLOR_SCALE = "Blugrn"
-        for i, mode_idx in enumerate(mode_indices):
-            is_cmplx_mode = self.is_complex_mode[mode_idx]
-            eigfn_re_pred = eigfn_pred[:, mode_idx].real  # Re(λ_i^t * <u_i,z_t>)
-            eigfn_im_pred = eigfn_pred[:, mode_idx].imag  # Im(λ_i^t * <u_i,z_t>)
+            # λ_i^t for t in [0, context_window_length)
+            eigval_t = np.asarray([self.eigvals ** t for t in range(context_window_length)])
+            eigfn_0 = eigfn[0, :]
+            # pred_sorted_eigfn.shape = (context_window, self.n_modes)
+            pred_sorted_eigfn = np.einsum("...l,tl->...tl", eigfn_0, eigval_t)
 
-            eigfn_re = eigfn[:, mode_idx].real
-            eigfn_im = eigfn[:, mode_idx].imag
+            fig = make_subplots(rows=self.n_modes, cols=2, column_widths=[0.33, 0.66],
+                                subplot_titles=[f"Mode {i // 2}" for i in range(2 * self.n_modes)],
+                                vertical_spacing=vertical_spacing,
+                                shared_xaxes=True,
+                                # shared_yaxes='rows'
+                                )
 
-            # Plot the predicted eigenfunction dynamics in the complex plane with equal aspect ratio
-            fig.add_trace(go.Scatter(x=eigfn_im_pred,
-                                     y=eigfn_re_pred,
-                                     mode='markers',
-                                     marker=dict(color=time_normalized, colorscale=COLOR_SCALE, size=4),
-                                     name=f"Mode {i}",
-                                     legendgroup=f"mode{i}"),
-                          row=i + 1, col=1)
+            time_horizon = context_window_length * self.dt
+            time_normalized = time / (time_horizon * self.dt)
 
-            # Plot the true eigenfunction dynamics in the complex plane
-            fig.add_trace(go.Scatter(x=eigfn_im,
-                                     y=eigfn_re,
-                                     mode='lines',
-                                     line=dict(color='black', width=1),
-                                     name=f"Mode {i}",
-                                     legendgroup=f"mode{i}"),
-                          row=i + 1, col=1)
+            COLOR_SCALE = "Blugrn"
+            for mode_idx in range(self.n_modes):
+                show_legend = mode_idx == 0
+                is_cmplx_mode = self.is_complex_mode[mode_idx]
+                is_enabled_mode = True  # TODO: Make user selection dependent
 
-            # Plot the real part of the eigenfunction dynamics vs time
-            fig.add_trace(go.Scatter(x=time,
-                                     y=eigfn_re_pred * (2 if is_cmplx_mode else 1),
-                                     mode='markers',
-                                     marker=dict(color=time_normalized, colorscale=COLOR_SCALE, size=4),
-                                     name=f"Mode {i}",
-                                     legendgroup=f"mode{i}"),
-                          row=i + 1, col=2)
+                pred_eigfn_re = pred_sorted_eigfn[:, mode_idx].real  # Re(λ_i^t * <u_i,z_t>)
+                pred_eigfn_im = pred_sorted_eigfn[:, mode_idx].imag  # Im(λ_i^t * <u_i,z_t>)
 
-            # Plot the true real part of the eigenfunction dynamics vs time
-            fig.add_trace(go.Scatter(x=time,
-                                     y=eigfn_re * (2 if is_cmplx_mode else 1),
-                                     mode='lines',
-                                     line=dict(color='black', width=1),
-                                     name=f"Mode {i}",
-                                     legendgroup=f"mode{i}"),
-                          row=i + 1, col=2)
+                if gt_sorted_eigfn is not None:
+                    eigfn_re = gt_sorted_eigfn[:, mode_idx].real
+                    eigfn_im = gt_sorted_eigfn[:, mode_idx].imag
 
-            # Plot the area between the predicted and true real part of the eigenfunction dynamics
-            fig.add_trace(go.Scatter(x=np.concatenate((time, time[::-1])),
-                                     y=np.concatenate((eigfn_re_pred * (2 if is_cmplx_mode else 1),
-                                                       eigfn_re[::-1] * (2 if is_cmplx_mode else 1))),
-                                     fill='toself',
-                                     fillcolor='rgba(0,0,0,0.1)',
-                                     line=dict(color='rgba(0,0,0,0)'),
-                                     name=f"Mode {i}",
-                                     legendgroup=f"mode{i}"),
-                          row=i + 1, col=2)
+                # Plotly usefull parameters
+                legendgroup_pred = f"Pred"
+                legendgroup_true = f"True"
+                # First Column: Complex plane mode evolution -----------------------------------------------------------
+                meta = dict(xaxis='mode im part', yaxis='mode re part')
+                fig.add_trace(go.Scatter(x=pred_eigfn_im,  # PREDICTED eigenfunction
+                                         y=pred_eigfn_re,
+                                         mode='markers',
+                                         marker=dict(color=time_normalized, colorscale=COLOR_SCALE, size=4),
+                                         name=f"{legendgroup_pred} {mode_idx}",
+                                         showlegend=show_legend,
+                                         legendgroup=legendgroup_pred,
+                                         meta=meta),
+                              row=mode_idx + 1, col=1)
 
+                if gt_sorted_eigfn is not None:
+                    fig.add_trace(go.Scatter(x=eigfn_im,  # TRUE eigenfunction
+                                             y=eigfn_re,
+                                             mode='lines',
+                                             line=dict(color=true_eigfn_color, width=1),
+                                             name=f"{legendgroup_true} {mode_idx}",
+                                             showlegend=show_legend,
+                                             legendgroup=legendgroup_true,
+                                             meta=meta),
+                                  row=mode_idx + 1, col=1)
 
-        # Set the overall layout size. Adjust the width to accommodate your 200px wide first column.
-        # This width calculation is an approximation and might need tweaking based on your actual layout and margins.
-        fig.update_layout(
-            autosize=True,
-            width=fig_width,
-            height=fig_height,
-            showlegend=False,  # Hide the legend
-            )
+                # Second Column: Real part of the mode evolution vs. time ----------------------------------------------
+                meta = dict(xaxis='time', yaxis='mode re part')
+                fig.add_trace(go.Scatter(x=time,
+                                         y=pred_eigfn_re * (2 if is_cmplx_mode else 1),
+                                         mode='markers',
+                                         marker=dict(color=time_normalized, colorscale=COLOR_SCALE, size=4),
+                                         name=f"{legendgroup_pred} {mode_idx}",
+                                         showlegend=show_legend,
+                                         legendgroup=legendgroup_pred,
+                                         meta=meta),
+                              row=mode_idx + 1, col=2)
 
-        # Update y-axes of the first column only to have a fixed range for a square aspect ratio
-        # This is a workaround since direct width control per subplot isn't supported.
-        # You might need to adjust the range based on your data for a square appearance.
-        for i in range(n_modes_to_show):
-            fig.update_yaxes(row=i + 1, col=1, scaleanchor="x", scaleratio=1, )
-        fig.update_xaxes(rangeslider=dict(visible=False))
+                if gt_sorted_eigfn is not None:
+                    # Plot the true real part of the eigenfunction dynamics vs time
+                    fig.add_trace(go.Scatter(x=time,
+                                             y=eigfn_re * (2 if is_cmplx_mode else 1),
+                                             mode='lines',
+                                             line=dict(color=true_eigfn_color, width=1),
+                                             name=f"{legendgroup_pred} {mode_idx}",
+                                             showlegend=show_legend,
+                                             legendgroup=legendgroup_true,
+                                             meta=meta),
+                                  row=mode_idx + 1, col=2)
+                    # Plot the area between the predicted and true real part of the eigenfunction dynamics
+                    fig.add_trace(go.Scatter(x=np.concatenate((time, time[::-1])),
+                                             y=np.concatenate((pred_eigfn_re * (2 if is_cmplx_mode else 1),
+                                                               eigfn_re[::-1] * (2 if is_cmplx_mode else 1))),
+                                             fill='toself',
+                                             fillcolor='rgba(1,1,1,0.1)',
+                                             line=dict(width=0),
+                                             showlegend=False,
+                                             name=f"{legendgroup_pred} {mode_idx}",
+                                             legendgroup=legendgroup_pred,
+                                             meta=meta),
+                                  row=mode_idx + 1, col=2)
+
+            fig.update_layout(
+                autosize=True,
+                # width=fig_width,
+                height=fig_height,
+                showlegend=True,
+                template=self.plotly_template,
+                )
+
+            # Set some prefixed range modes to improve visualization.
+            for mode_idx in range(self.n_modes):
+                fig.update_xaxes(rangemode='tozero', row=mode_idx + 1, col=1)
+                fig.update_yaxes(rangemode='tozero', row=mode_idx + 1, col=1)
+                fig.update_yaxes(rangemode='tozero', row=mode_idx + 1, col=2)
+                fig.update_yaxes(scaleanchor="x", scaleratio=1, row=mode_idx + 1, col=1, )
+            self._modes_vs_time_fig = fig
+        else:
+            raise NotImplementedError("Updating an already created figure is not yet implemented.")
+            # fig = self._modes_vs_time_fig
+
         return fig
 
+    def plot_modes_visualization(self, df, fig: Optional[Figure] = None, mode_group=None):
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
 
-    def visual_mode_selection(self):
+        if df is None:  # Construct dataframe containing the data for easy plotting and selections across subplots.
+            df = pd.DataFrame({
+                "modes_idx":            range(self.n_modes),
+                "modes_frequencies":    self.modes_frequency,
+                "modes_modulus":        self.modes_modulus,
+                "modes_decay_rate":     self.modes_decay_rate,
+                "modes_transient_time": self.modes_transient_time})
+            df["group"] = mode_group
+            if mode_group is not None:
+                assert len(
+                    mode_group) == self._n_original_modes, "Number of colors must match the number of input eigvals"
+                mode_group = mode_group[self._sorted_eigs_indices]  # Get the ordered and relevant mode colors.
+                df["group"] = mode_group
+
+        fig = make_subplots(rows=3,
+                            cols=1,
+                            subplot_titles=['Eigvalue', 'Modulus', 'Frequency'],
+                            shared_xaxes=False,
+                            shared_yaxes=False)
+
+        # Plot the Real (y axis) and Imaginary (x axis) parts of the eigenvalues in the complex plane
+        fig.add_trace(go.Scatter(x=self.eigvals.real,
+                                 y=self.eigvals.imag,
+                                 mode='markers',
+                                 marker=dict(color='blue', size=8),
+                                 name="Eigenvalues"),
+                      row=1, col=1)
+
+    def plot_eigvals_metrics(self, replot: bool = False, mode_group: Optional[list[str]] = None):
+        import plotly.express as px
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+
+        DISCRETE_COLOR_SCALE, CONTINUOUS_COLOR_SCALE = px.colors.qualitative.Prism, px.colors.sequential.Cividis_r
+
+        if self._eigval_metrics_fig is None or replot:
+
+            def get_px_figure(dataframe, x_col, y_col, marginal_y=None, marginal_x=None):
+                discrete_color_map = None
+                if 'group' in dataframe.columns:
+                    coloring = 'group'
+                else:
+                    coloring = "modes_modulus"
+                # coloscale = DISCRETE_COLOR_SCALE if 'group' in dataframe.columns else CONTINUOUS_COLOR_SCALE
+
+                return px.scatter(dataframe,
+                                  x=x_col,
+                                  y=y_col,
+                                  # symbol="is_complex_mode",
+                                  # symbol_map={True: "circle", False: "square"},
+                                  hover_data=["modes_transient_time", "modes_decay_rate"],
+                                  hover_name="modes_sorted_idx",
+                                  custom_data=["modes_sorted_idx", "modes_original_idx"],
+                                  size="modes_modulus",
+                                  size_max=10,
+                                  # text=dataframe.modes_sorted_idx,  # Display index as text
+                                  color=coloring,
+                                  color_discrete_sequence=DISCRETE_COLOR_SCALE,
+                                  color_continuous_scale=CONTINUOUS_COLOR_SCALE,
+                                  template=self.plotly_template,
+                                  marginal_y=marginal_y,
+                                  marginal_x=marginal_x,
+                                  )
+
+            df = self._data_df
+            if mode_group is not None:
+                df["group"] = mode_group[self._sorted_eigs_indices]
+
+            # Plot the Im vs. Real part of the eigenvalues in the complex plane
+            fig_eig = get_px_figure(df, x_col="eigvals_re", y_col="eigvals_im")
+            fig_modulus = get_px_figure(df, x_col="modes_sorted_idx", y_col="modes_modulus")
+            fig_freq = get_px_figure(df, x_col="modes_sorted_idx", y_col="modes_frequencies")
+
+            # Create 3 subplots for the eigenvalues, modulus, and frequency. And transfer all traces to the subplots.
+            fig = make_subplots(rows=3, cols=1, subplot_titles=['Eigenvalues', 'Modulus', 'Frequency'])
+
+            shared_style = dict(unselected={"marker": {"opacity": 0.3}, "textfont": {"color": "rgba(0, 0, 0, 0)"}})
+            marker_style = {"line": {"width": 2, "color": "#BFC2C2"}}
+            for trace in fig_eig.data:
+                # Plot the unit circle
+                fig.add_trace(go.Scatter(x=np.cos(np.linspace(0, 2 * np.pi, 100)),
+                                         y=np.sin(np.linspace(0, 2 * np.pi, 100)),
+                                         mode='lines',
+                                         line=dict(color='rgba(204, 0, 102,100)', width=4),
+                                         name="Unit Circle",
+                                         showlegend=False),
+                              row=1, col=1)
+                meta = dict(xaxis='eigvals_re', yaxis='eigvals_im')
+                trace.update(meta=meta, **shared_style)
+                trace.marker.update(**marker_style)
+                fig.add_trace(trace, row=1, col=1)
+                # Set the aspect ratio to be 1:1
+                x_min, x_max = df["eigvals_re"].min(), df["eigvals_re"].max()
+                y_min, y_max = df["eigvals_im"].min(), df["eigvals_im"].max()
+                x_range, y_range = x_max - x_min, y_max - y_min
+                # Agugment the limits by 10% of the range
+                x_min, x_max = x_min - 0.1 * x_range, x_max + 0.1 * x_range
+                y_min, y_max = y_min - 0.1 * y_range, y_max + 0.1 * y_range
+                fig.update_yaxes(title_text="Imaginary",
+                                 autorange=False,
+                                 range=[y_min, y_max],
+                                 row=1, col=1)
+                fig.update_xaxes(title_text="Real",
+                                 scaleanchor="y",
+                                 autorange=False,
+                                 range=[x_min, x_max],
+                                 scaleratio=1, row=1, col=1)
+            for trace in fig_modulus.data:
+                meta = dict(xaxis='modes_sorted_idx', yaxis='modes_modulus')
+                trace.update(meta=meta, **shared_style, showlegend=False)
+                trace.on_selection(self.selection_callback_handler)
+                trace.marker.update(**marker_style)
+                fig.add_trace(trace, row=2, col=1,)
+                fig.update_yaxes(title_text="Modulus", row=2, col=1)
+                fig.update_xaxes(title_text="Modes", row=2, col=1)
+            for trace in fig_freq.data:
+                meta = dict(xaxis='modes_sorted_idx', yaxis='modes_frequencies')
+                trace.update(meta=meta, **shared_style, showlegend=False)
+                trace.on_selection(self.selection_callback_handler)
+                trace.marker.update(**marker_style)
+                fig.add_trace(trace, row=3, col=1)
+                fig.update_yaxes(
+                    title_text=f"Frequency [{'Hz' if self.dt != 1.0 else '1/steps'}]", row=3, col=1)
+                fig.update_xaxes(title_text="Modes", row=3, col=1)
+
+
+            fig.update_layout(dragmode="select", # instead of zooming in allow user to select ranges.
+                              # hovermode=False,
+                              # newselection_mode="lasso",
+                              template=self.plotly_template,
+                              )
+
+            self._eigval_metrics_fig = fig
+        else:
+            raise NotImplementedError("Updating an already created figure is not yet implemented.")
+
+        return fig
+
+    def selection_callback_handler(self, trace, points, selector) -> None:
+        print(f"Callback points: {points}")
+
+    def visual_mode_selection(self, mode_colors: Optional[list[str]] = None):
+
         from dash import Dash, dcc, html, Input, Output, callback
         import pandas as pd
         import plotly.express as px
@@ -359,39 +592,33 @@ class ModesInfo:
         app = Dash(__name__, external_stylesheets=external_stylesheets)
 
         modes_info = self
+
+        if mode_colors is None:
+            mode_colors = np.arange(modes_info.n_modes).tolist()
+        else:
+            assert len(mode_colors) == self._n_original_modes, "Number of colors must match the number of input eigvals"
+            mode_colors = mode_colors[self._sorted_eigs_indices]  # Get the ordered and relevant mode colors.
+
         # Assuming `modes_info` is an instance of `ModesInfo` class
         df = pd.DataFrame({
             "modes_idx":            range(modes_info.n_modes),
             "modes_frequencies":    modes_info.modes_frequency,
             "modes_modulus":        modes_info.modes_modulus,
             "modes_decay_rate":     modes_info.modes_decay_rate,
-            "modes_transient_time": modes_info.modes_transient_time
+            "modes_transient_time": modes_info.modes_transient_time,
+            "color":                mode_colors,
             })
 
-        app.layout = html.Div(
-            [
-                html.Div(
-                    dcc.Graph(id="g1", config={"displayModeBar": False}),
-                    className="four columns",
-                    ),
-                html.Div(
-                    dcc.Graph(id="g2", config={"displayModeBar": False}),
-                    className="four columns",
-                    ),
-                html.Div(
-                    dcc.Graph(id="g3", config={"displayModeBar": False}),
-                    className="four columns",
-                    ),
-                ],
-            className="row",
-            )
+        app.layout = html.Div([
+            dcc.Graph(id="g1", config={"displayModeBar": False}),
+            dcc.Graph(id="g2", config={"displayModeBar": False}),
+            dcc.Graph(id="g3", config={"displayModeBar": False}),
+            ])
 
         def get_figure(df, y_col, selectedpoints, selectedpoints_local):
-            # similar to the original get_figure function, but x_col is always "modes_idx"
             x_col = "modes_idx"
-            # rest of the function remains the same
 
-            if selectedpoints_local and selectedpoints_local["range"]:
+            if selectedpoints_local and "range" in selectedpoints_local and selectedpoints_local["range"]:
                 ranges = selectedpoints_local["range"]
                 selection_bounds = {
                     "x0": ranges["x"][0],
@@ -399,6 +626,7 @@ class ModesInfo:
                     "y0": ranges["y"][0],
                     "y1": ranges["y"][1],
                     }
+                custom_selection = True
             else:
                 selection_bounds = {
                     "x0": np.min(df[x_col]),
@@ -406,40 +634,38 @@ class ModesInfo:
                     "y0": np.min(df[y_col]),
                     "y1": np.max(df[y_col]),
                     }
+                custom_selection = False
 
-            # set which points are selected with the `selectedpoints` property
-            # and style those points with the `selected` and `unselected`
-            # attribute. see
-            # https://medium.com/@plotlygraphs/notes-from-the-latest-plotly-js-release-b035a5b43e21
-            # for an explanation
-            fig = px.scatter(df, x=df[x_col], y=df[y_col], text=df.index)
+            fig = px.scatter(df,
+                             x=df[x_col],
+                             y=df[y_col],
+                             text=df.index,  # Display index as text
+                             color=df['color'],  # Use the 'color' column for coloring
+                             color_discrete_sequence=px.colors.qualitative.Plotly
+                             )
 
             fig.update_traces(
                 selectedpoints=selectedpoints,
-                customdata=df.index,
+                customdata=df.modes_idx,
                 mode="markers+text",
-                marker={"color": "rgba(0, 116, 217, 0.7)", "size": 20},
-                unselected={
-                    "marker":   {"opacity": 0.3},
-                    "textfont": {"color": "rgba(0, 0, 0, 0)"},
-                    },
+                marker={"size": 20},
+                unselected={"marker": {"opacity": 0.3}, "textfont": {"color": "rgba(0, 0, 0, 0)"}},
                 )
 
             fig.update_layout(
                 margin={"l": 20, "r": 0, "b": 15, "t": 5},
-                dragmode="select",
+                dragmode="select",  # instead of zooming in allow user to select ranges.
                 hovermode=False,
                 newselection_mode="gradual",
                 )
 
-            fig.add_shape(
-                dict(
-                    {"type": "rect", "line": {"width": 1, "dash": "dot", "color": "darkgrey"}},
+            if custom_selection:
+                fig.add_shape(dict(
+                    {"type": "rect", "line": {"width": 2, "dash": "dot", "color": "darkgrey"}},
                     **selection_bounds
-                    )
-                )
-            return fig
+                    ))
 
+            return fig
 
         @callback(
             Output("g1", "figure"),
@@ -450,12 +676,13 @@ class ModesInfo:
             Input("g3", "selectedData"),
             )
         def callback(selection1, selection2, selection3):
-            selectedpoints = df.index
+            selectedpoints = np.asarray(df.index)
+
             for selected_data in [selection1, selection2, selection3]:
                 if selected_data and selected_data["points"]:
-                    selectedpoints = np.intersect1d(
-                        selectedpoints, [p["customdata"] for p in selected_data["points"]]
-                        )
+                    selected_idx = [int(p["text"]) for p in selected_data["points"]]
+                    selectedpoints = np.intersect1d(selectedpoints, selected_idx)
+            print(f"Selected points: {selectedpoints}")
 
             return [
                 get_figure(df, "modes_modulus", selectedpoints, selection1),
@@ -464,5 +691,3 @@ class ModesInfo:
                 ]
 
         app.run_server(debug=False)
-
-

@@ -4,10 +4,9 @@ from escnn.group import Representation
 from kooplearn._src.check_deps import check_torch_deps
 from kooplearn._src.metrics import vectorized_correlation_scores, vectorized_spectral_scores
 from kooplearn.data import TensorContextDataset
+from typing import Optional, Union
 
 check_torch_deps()
-from typing import Optional  # noqa: E402
-
 import torch  # noqa: E402
 
 
@@ -217,62 +216,83 @@ def vectorized_cov_cross_cov(X_contexts: torch.Tensor,
 
     return CovYXdt
 
+_cache_G_rep = {}
 
 def latent_space_metrics(
         Z_contexts: TensorContextDataset,
-        Z_prime_contexts: TensorContextDataset,
-        center_covariances: bool = False,
-        G_rep_Z: Optional[torch.Tensor] = None,
-        grad_correlation_score=True,
-        grad_relaxed_score=True,
+        Z_prime_contexts: Optional[TensorContextDataset] = None,
+        rep_Z: Optional[Representation] = None,
+        return_corr_score: Union[str, bool] = False,  # True, False, "grad"
+        return_spectral_score: Union[str, bool] = False,     # True, False, "grad"
+        orth_ref: Union[str, bool] = False,
         run_checks=False):
+
+    # Initialize potential outputs
+    covZ, covZp, covZpZdt, spectral_scores, corr_scores = None, None, None, None, None
+    orth_reg_Z, orth_reg_Zp = None, None
+
     batch, time_horizon, latent_state_dim = Z_contexts.data.shape
     n_samples = batch * time_horizon
 
-    if center_covariances:
-        Z = Z_contexts.data - torch.mean(Z_contexts.data, dim=(0, 1))
-        Z_prime = Z_prime_contexts.data - torch.mean(Z_prime_contexts.data, dim=(0, 1))
-    else:
-        Z, Z_prime = Z_contexts.data, Z_prime_contexts.data
+    Z, Z_prime = Z_contexts.data, Z_prime_contexts.data if Z_prime_contexts is not None else None
     # Since we assume time homogenous dynamics, the CovX and CovY are "time-independent" so we compute them
     # using the `n=batch * time_horizon` samples, to get better empirical estimates.
     covZ = torch.einsum("btx,bty->xy", Z, Z) / n_samples
-    covZp = torch.einsum("btx,bty->xy", Z_prime, Z_prime) / n_samples
 
-    covZpZdt = vectorized_cov_cross_cov(
-        X_contexts=Z[:, :-1, :],
-        Y_contexts=Z_prime[:, 1:, :],
-        run_checks=run_checks)
+    if Z_prime is not None: # Compute Var(Z') and Cov(Z', Z'_t+dt)
+        covZp = torch.einsum("btx,bty->xy", Z_prime, Z_prime) / n_samples
+        covZpZdt = vectorized_cov_cross_cov(
+            X_contexts=Z[:, :-1, :],
+            Y_contexts=Z_prime[:, 1:, :],
+            run_checks=run_checks)
 
-    if G_rep_Z is not None:  # Apply equivariant constraints to the empirical estimates by group averaging.
-        assert G_rep_Z.ndim == 3, f"G_rep_Z: {G_rep_Z.shape}. Expected (|H|, |Z|, |Z|)"
-        G_order = G_rep_Z.shape[0] + 1
+    if rep_Z is not None:  # Apply equivariant constraints to the empirical estimates by group averaging.
+        if rep_Z.name not in _cache_G_rep:
+            G = rep_Z.group
+            G_rep_Z = torch.stack([torch.tensor(rep_Z(g)) for g in G.elements], dim=0)
+            _cache_G_rep[rep_Z.name] = G_rep_Z.to(device=covZ.device, dtype=covZ.dtype)
+        G_rep_Z = _cache_G_rep[rep_Z.name].to(device=covZ.device, dtype=covZ.dtype)
+        assert G_rep_Z.ndim == 3, f"G_rep_Z: {G_rep_Z.shape}. Expected (|G|, |Z|, |Z|)"
+        G_order = G_rep_Z.shape[0]
         G_rep_Z_inv = torch.permute(G_rep_Z, dims=(0, 2, 1))
-        # As identity e ∉ G.generators, we add the trivially transformed covariance matrix covX/covY/covYX to the sum.
-        covZ_equiv = (covZ + torch.einsum('Gya,ab,Gbx->yx', G_rep_Z, covZ, G_rep_Z_inv)) / G_order
-        covZp_equiv = (covZp + torch.einsum('Gya,ab,Gbx->yx', G_rep_Z, covZp, G_rep_Z_inv)) / G_order
-        covZpZdt_equiv = (covZpZdt + torch.einsum('Gya,tab,Gbx->tyx', G_rep_Z, covZpZdt, G_rep_Z_inv)) / G_order
-        # Update the covariance matrices with the equivariant constraints
-        covZ, covZp, covZpZdt = covZ_equiv, covZp_equiv, covZpZdt_equiv
+        covZ_equiv = torch.einsum('Gya,ab,Gbx->yx', G_rep_Z, covZ, G_rep_Z_inv) / G_order
+        covZ = covZ_equiv
+        if Z_prime is not None:
+            covZp_equiv = torch.einsum('Gya,ab,Gbx->yx', G_rep_Z, covZp, G_rep_Z_inv) / G_order
+            covZpZdt_equiv = torch.einsum('Gya,tab,Gbx->tyx', G_rep_Z, covZpZdt, G_rep_Z_inv) / G_order
+            # Update the covariance matrices with the equivariant constraints
+            covZp, covZpZdt = covZp_equiv, covZpZdt_equiv
 
-    # Compute both relaxed and un-relaxed scores, while computing gradients only for the selected score ============
-    with torch.set_grad_enabled(grad_relaxed_score):
-        # spectral_score[dt-1] := ||Cov(Z'_t+dt, Z_t)||^2_HS/(||Cov(Z')|| ||Cov(Z)|| | ∀ t, dt in [1, time_horizon]
-        spectral_scores = vectorized_spectral_scores(covYXdt=covZpZdt,
-                                                     covX=covZ,
-                                                     covY=covZp,
-                                                     run_checks=run_checks)
-    with torch.set_grad_enabled(grad_correlation_score):
-        # corr_score[dt-1] := ||Cov(Z')^1/2 Cov(Z'_t+dt, Z_t) Cov(Z)^1/2||^2_HS  | ∀ t, dt in [1, time_horizon]
-        corr_scores = vectorized_correlation_scores(covYXdt=covZpZdt,
-                                                    covX=covZ,  # illegal memory access if not clone
-                                                    covY=covZp,  # dunno wtf is happening here.
-                                                    run_checks=False)
+    if Z_prime is not None:
+        # Check if to compute metrics for logging or for backpropagation _______________________________________________
+        _corr_score = return_corr_score if isinstance(return_corr_score, bool) else return_corr_score == "grad"
+        _corr_score_grad = _corr_score and return_corr_score == "grad"
+        _spectral_score = return_spectral_score if isinstance(return_spectral_score, bool) else return_spectral_score == "grad"
+        _spectral_score_grad = _spectral_score and return_spectral_score == "grad"
+        # Compute both relaxed and un-relaxed scores, while computing gradients only for the selected score ============
+        if _spectral_score:
+            with torch.set_grad_enabled(_spectral_score_grad):
+                # spectral_score[dt-1] := ||Cov(Z'_t+dt, Z_t)||^2_HS/(||Cov(Z')|| ||Cov(Z)|| | ∀ t, dt in [1, T]
+                spectral_scores = vectorized_spectral_scores(covYXdt=covZpZdt,
+                                                             covX=covZ,
+                                                             covY=covZp,
+                                                             run_checks=run_checks)
+        if _corr_score:
+            with torch.set_grad_enabled(_corr_score_grad):
+                # corr_score[dt-1] := ||Cov(Z')^1/2 Cov(Z'_t+dt, Z_t) Cov(Z)^1/2||^2_HS  | ∀ t, dt in [1, time_horizon]
+                corr_scores = vectorized_correlation_scores(covYXdt=covZpZdt,
+                                                            covX=covZ,
+                                                            covY=covZp,
+                                                            run_checks=False)
 
-    # Orthogonality regularization: || CovZZ - I || + || CovZ'Z' - I || ============================================
-    I = torch.eye(latent_state_dim, device=covZ.device)
-    orth_reg_Z = torch.linalg.norm(covZ - I, ord="fro")
-    orth_reg_Zp = torch.linalg.norm(covZp - I, ord="fro")
+    _orth_ref = orth_ref if isinstance(orth_ref, bool) else orth_ref == "grad"
+    _orth_ref_grad = _orth_ref and orth_ref == "grad"
+    if _orth_ref:
+        with torch.set_grad_enabled(_orth_ref_grad):
+            # Orthogonality regularization: || CovZZ - I || + || CovZ'Z' - I || ========================================
+            I = torch.eye(latent_state_dim, device=covZ.device)
+            orth_reg_Z = torch.linalg.norm(covZ - I, ord="fro")
+            orth_reg_Zp = torch.linalg.norm(covZp - I, ord="fro") if Z_prime is not None else None
 
     LatentSpaceMetrics = namedtuple(
         typename='LatentSpaceMetrics',

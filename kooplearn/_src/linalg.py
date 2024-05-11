@@ -333,24 +333,57 @@ def full_rank_equivariant_lstsq(X: torch.Tensor,
         B: Bias vector of dimension (|y|, 1). Set to None if bias=False.
     """
 
-    if group_average:
-        raise NotImplementedError("Need to implement change of basis to isotypic basis on input and output and solve"
-                                  "the lstsq problem for each isotypic space independently")
-
     if rep_X is None or rep_Y is None:
         return full_rank_lstsq(X, Y, bias=bias)
     else:
         G = rep_X.group
+        if G.continuous:
+            raise NotImplementedError("Continuous groups are not supported yet. need fancy lstsq solver.")
         assert rep_Y.group == G, "Representations must belong to the same group."
+
         G_X, G_Y = [X], [Y]
-        for h in G.generators:
-            rep_X_g = torch.tensor(rep_X(h), dtype=X.dtype, device=X.device)
-            rep_Y_g = torch.tensor(rep_Y(h), dtype=X.dtype, device=X.device)
+        for g in G.elements:
+            rep_X_g = torch.tensor(rep_X(g), dtype=X.dtype, device=X.device)
+            rep_Y_g = torch.tensor(rep_Y(g), dtype=X.dtype, device=X.device)
             G_X.append(torch.einsum('ij,js->is', rep_X_g, X))
             G_Y.append(torch.einsum('ij,js->is', rep_Y_g, Y))
         G_X = torch.cat(G_X, dim=1)
         G_Y = torch.cat(G_Y, dim=1)
-        return full_rank_lstsq(G_X, G_Y, bias=bias)
+        A, B = full_rank_lstsq(G_X, G_Y, bias=bias)
+
+        # Do the group average trick to enforce equivariance. A_g = mean( rep_Y(g) @ A @ rep_X(g)^-1 ) for g in G
+        # This is equivalent to applying the group average trick on the singular vectors of the covariance matrices.
+        A_G = []
+        for g in G.elements:
+            rep_X_g_inv = torch.tensor(rep_X(~g), dtype=X.dtype, device=X.device)
+            rep_Y_g = torch.tensor(rep_Y(g), dtype=X.dtype, device=X.device)
+            A_g = rep_Y_g @ A @ rep_X_g_inv
+            A_G.append(A_g)
+        A_G = torch.stack(A_G, dim=0)
+        A_G = torch.mean(A_G, dim=0).to(dtype=X.dtype, device=X.device)
+        B_G = None
+        if bias:
+            # The bias term exits only in the eigenspaces of trivial representation of G.
+            has_trivial_irreps = G.trivial_representation.id in rep_Y.irreps
+            if has_trivial_irreps:
+                # We compute a projector that ensures that the bias term is only present in the trivial irrep.
+                S = np.zeros((rep_Y.size, rep_Y.size))
+                cum_dim = 0
+                for irrep_id in rep_Y.irreps:
+                    irrep = G.irrep(*irrep_id)
+                    # Get dimensions of the irrep in the original basis
+                    irrep_dims = range(cum_dim, cum_dim + irrep.size)
+                    if irrep_id == G.trivial_representation.id:
+                        S[irrep_dims, irrep_dims] = 1
+                    cum_dim += irrep.size
+                mean_projector = torch.tensor(
+                    rep_Y.change_of_basis @ S @ rep_Y.change_of_basis_inv,
+                    dtype=X.dtype,
+                    device=X.device)
+                B_G = mean_projector @ B
+            else:
+                B_G = torch.zeros_like(B)
+        return A_G, B_G
 
     # A, B = full_rank_lstsq(X, Y, bias=bias)
     # if rep_X is None or rep_Y is None:
@@ -374,7 +407,8 @@ def full_rank_equivariant_lstsq(X: torch.Tensor,
     # A_G = torch.mean(A_G, dim=0)
     #
     # if bias:
-    #     # Bias can only be present in the dimension of the output space associated with the trivial representation of G.
+    #     # Bias can only be present in the dimension of the output space associated with the trivial representation
+    #     of G.
     #     B_G = torch.zeros_like(B)
     #     dim = 0
     #     for irrep_id in rep_Y.irreps:
@@ -385,6 +419,17 @@ def full_rank_equivariant_lstsq(X: torch.Tensor,
     #     return A_G.to(dtype=X.dtype, device=X.device), B_G.to(dtype=X.dtype, device=X.device)
     # return A_G.to(dtype=X.dtype, device=X.device), None
 
+    if bias:
+        # Bias can only be present in the dimension of the output space associated with the trivial representation of G.
+        B_G = torch.zeros_like(B)
+        dim = 0
+        for irrep_id in rep_Y.irreps:
+            irrep = group.irrep(*irrep_id if isinstance(irrep_id, tuple) else (irrep_id,))
+            if irrep == group.trivial_representation:
+                B_G[dim] = B[dim]
+            dim += irrep.size
+        return A_G.to(dtype=X.dtype, device=X.device), B_G.to(dtype=X.dtype, device=X.device)
+    return A_G.to(dtype=X.dtype, device=X.device), None
 
 def batch_matrix_sqrt_inv(C, epsilon=None, run_checks=False):
     """ Compute the inverse square root of a batch of matrices.

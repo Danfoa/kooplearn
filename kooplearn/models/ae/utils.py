@@ -172,7 +172,7 @@ def flatten_context_data(x: TensorContextDataset) -> torch.Tensor:
     return flat_data
 
 
-def unflatten_context_data(x_reshaped: torch.Tensor, batch_size: int, features_shape: tuple) -> TensorContextDataset:
+def unflatten_context_data(x_reshaped: torch.Tensor, batch_size: int) -> TensorContextDataset:
     """ Returns a (batch, context_length, *feature_dims) view of the tensor (batch_size * context_length, *feature_dims).
 
     Args:
@@ -187,6 +187,5 @@ def unflatten_context_data(x_reshaped: torch.Tensor, batch_size: int, features_s
     assert total_elements % batch_size == 0, f"Total elements {total_elements} not divisible by batch size {batch_size}"
     context_length = total_elements // batch_size
 
-    new_shape = (batch_size, context_length) + features_shape
-    x_original = x_reshaped.view(new_shape)
+    x_original = x_reshaped.view((batch_size, context_length, -1))
     return TensorContextDataset(x_original)

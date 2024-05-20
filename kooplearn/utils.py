@@ -6,7 +6,9 @@ import numpy as np
 import pandas as pd
 from lightning.pytorch.callbacks import ModelCheckpoint
 from plotly.graph_objs import Figure
+import logging
 
+logger = logging.getLogger(__name__)
 
 def check_if_resume_experiment(ckpt_call: Optional[ModelCheckpoint] = None):
     """ Checks if an experiment should be resumed based on the existence of checkpoint files.
@@ -73,11 +75,12 @@ class ModesInfo:
     eigvals: np.ndarray
     eigvecs_r: np.ndarray
     state_eigenbasis: np.ndarray
+    modes_group: Optional[list[str]] = None
     linear_decoder: Optional[Union[np.ndarray, any]] = None
-    sort_by: str = "modulus"
-    
+    sort_metric: str = "modulus"
+
     plotly_template: str = "plotly_dark"
-    
+
     def __post_init__(self):
         """Identifies real and complex conjugate pairs of eigenvectors, along with their associated dimensions
 
@@ -90,16 +93,26 @@ class ModesInfo:
         # Keep memory of the original number of modes/eigenvalues
         self._n_original_modes = len(self.eigvals)
 
+        # Snap eigvals close to the init circle to be in the unit circle
+        self.is_mode_marginally_stable = np.abs(np.abs(self.eigvals) - 1) < 1e-3
+        self.eigvals[self.is_mode_marginally_stable] = (self.eigvals[self.is_mode_marginally_stable] /
+                                                        np.abs(self.eigvals[self.is_mode_marginally_stable]))
+        # Snap unstable eigvals to the unit circle
+        is_mode_unstable = np.abs(self.eigvals) > 1.0
+        self.eigvals[is_mode_unstable] /= np.abs(self.eigvals[is_mode_unstable])
+        if np.any(is_mode_unstable):
+            logger.warning(f"Unstable eigenvalues were snapped to the unit circle: {np.argwhere(is_mode_unstable)}")
+
         real_eigs, cplx_eigs, real_eigs_indices, cplx_eigs_indices = parse_cplx_eig(self.eigvals)
 
-        if self.sort_by == "modulus":
+        if self.sort_metric == "modulus":
             real_eigs_modulus = np.abs(real_eigs)
             cplx_eigs_modulus = np.abs(cplx_eigs)
             eigs_sort_metric = np.concatenate((real_eigs_modulus, cplx_eigs_modulus))
             eigs_indices = np.concatenate((real_eigs_indices, cplx_eigs_indices))
             # Sort the eigenvalues by modulus |λ_i| in descending order.
             sorted_indices = np.flip(np.argsort(eigs_sort_metric))
-        elif self.sort_by == "modulus-amplitude":
+        elif self.sort_metric == "modulus-amplitude":
             real_eigs_modulus = np.abs(real_eigs)
             cplx_eigs_modulus = np.abs(cplx_eigs)
             real_eigs_amplitude = np.abs(self.state_eigenbasis[0, 0, real_eigs_indices])
@@ -109,7 +122,7 @@ class ModesInfo:
             eigs_indices = np.concatenate((real_eigs_indices, cplx_eigs_indices))
             # Sort the eigenvalues by the product of modulus |λ_i| and amplitude |<v_i, z_k>| in descending order.
             sorted_indices = np.flip(np.argsort(eigs_sort_metric))
-        elif self.sort_by == "freq":
+        elif self.sort_metric == "freq":
             # Sort real-eigvals by modulus (decreasing), and complex eigvals by frequency (increasing)
             freqs_cplx = np.angle(cplx_eigs) / (2 * np.pi * self.dt)
             sorted_cplx_indices = cplx_eigs_indices[np.argsort(freqs_cplx)]
@@ -117,7 +130,7 @@ class ModesInfo:
             eigs_indices = np.arange(len(self.eigvals))
             sorted_indices = np.concatenate((sorted_real_indices, sorted_cplx_indices))
         else:
-            raise NotImplementedError(f"Mode sorting by {self.sort_by} is not implemented yet.")
+            raise NotImplementedError(f"Mode sorting by {self.sort_metric} is not implemented yet.")
 
         # Store the sorted indices of eigenspaces by modulus, and the indices of real and complex eigenspaces.
         # Such that self.eigvals[self._sorted_eigs_indices] returns the sorted eigenvalues.
@@ -129,6 +142,7 @@ class ModesInfo:
         self.eigvals = self.eigvals[self._sorted_eigs_indices]
         self.eigvecs_r = self.eigvecs_r[:, self._sorted_eigs_indices]
         self.state_eigenbasis = self.state_eigenbasis[..., self._sorted_eigs_indices]
+        self.is_mode_marginally_stable = self.is_mode_marginally_stable[self._sorted_eigs_indices]
         # Utility array to identify if in the new order the modes/eigvals are to be treated as complex or real
         self.is_complex_mode = [idx in cplx_eigs_indices for idx in self._sorted_eigs_indices]
 
@@ -159,15 +173,22 @@ class ModesInfo:
             "modes_original_idx":   self._sorted_eigs_indices,
             "modes_frequencies":    self.modes_frequency,
             "modes_modulus":        self.modes_modulus,
+            "modes_amplitude":      self.modes_amplitude,
+            "modulus-amplitude":    self.modes_modulus * self.modes_amplitude,
             "modes_decay_rate":     self.modes_decay_rate,
             "modes_transient_time": self.modes_transient_time,
-            "eigvals_re":            self.eigvals.real,
-            "eigvals_im":            self.eigvals.imag,
-            "is_complex_mode":       self.is_complex_mode,
+            "eigvals_re":           self.eigvals.real,
+            "eigvals_im":           self.eigvals.imag,
+            "is_complex_mode":      self.is_complex_mode,
+            "is_marginally_stable": ["stable" if s else "transient" for s in self.is_mode_marginally_stable],
             })
 
         self._modes_vs_time_fig = None
         self._eigval_metrics_fig = None
+
+    def sort_by(self, sort_metric: str):
+        self.sort_metric = sort_metric
+        self.__post_init__()
 
     @property
     def n_modes(self):
@@ -239,7 +260,7 @@ class ModesInfo:
     @property
     def modes_amplitude(self):
         # Compute <u_i, z_k>.
-        mode_amplitude = np.abs(self.state_eigenbasis)
+        mode_amplitude = np.abs(self.state_eigenbasis)[0, 0, ...]  # Return projections of the initial state
         mode_amplitude[..., self.is_complex_mode] *= 2
         return mode_amplitude
 
@@ -270,7 +291,9 @@ class ModesInfo:
             (if decay rate is positive).
         """
         decay_rates = self.modes_decay_rate
-        return 1 / decay_rates * np.log(90. / 100.)
+        transient_time = 1 / decay_rates * np.log(90. / 100.)
+        transient_time[np.abs(decay_rates - 0.0) < 0.001] = (1 / 0.001) * np.log(90. / 100.)
+        return transient_time
 
     def plot_eigfn_dynamics(
             self,
@@ -386,7 +409,7 @@ class ModesInfo:
                                          mode='markers',
                                          marker=dict(color=time_normalized, colorscale=COLOR_SCALE, size=4),
                                          name=f"{legendgroup_pred} {mode_idx}",
-                                         showlegend=show_legend,
+                                         showlegend=False,
                                          legendgroup=legendgroup_pred,
                                          meta=meta),
                               row=mode_idx + 1, col=2)
@@ -398,7 +421,7 @@ class ModesInfo:
                                              mode='lines',
                                              line=dict(color=true_eigfn_color, width=1),
                                              name=f"{legendgroup_pred} {mode_idx}",
-                                             showlegend=show_legend,
+                                             showlegend=False,
                                              legendgroup=legendgroup_true,
                                              meta=meta),
                                   row=mode_idx + 1, col=2)
@@ -468,7 +491,11 @@ class ModesInfo:
                                  name="Eigenvalues"),
                       row=1, col=1)
 
-    def plot_eigvals_metrics(self, replot: bool = False, mode_group: Optional[list[str]] = None):
+    def plot_eigvals_metrics(self, replot: bool = False,
+                             mode_group: Optional[list[str]] = None,
+                             fig: Optional[Figure] = None,
+                             subplot_coords=((1, 1), (2, 1), (3, 1), (4, 1)),
+                             ):
         import plotly.express as px
         import plotly.graph_objects as go
         from plotly.subplots import make_subplots
@@ -505,20 +532,27 @@ class ModesInfo:
                                   )
 
             df = self._data_df
+            df['modulus-amplitude'] = df['modes_modulus'] * df['modes_amplitude']
             if mode_group is not None:
                 df["group"] = mode_group[self._sorted_eigs_indices]
+            else:
+                df["group"] = df["is_marginally_stable"]
 
             # Plot the Im vs. Real part of the eigenvalues in the complex plane
             fig_eig = get_px_figure(df, x_col="eigvals_re", y_col="eigvals_im")
             fig_modulus = get_px_figure(df, x_col="modes_sorted_idx", y_col="modes_modulus")
+            fig_mod_amplitude = get_px_figure(df, x_col="modes_sorted_idx", y_col='modulus-amplitude')
             fig_freq = get_px_figure(df, x_col="modes_sorted_idx", y_col="modes_frequencies")
 
             # Create 3 subplots for the eigenvalues, modulus, and frequency. And transfer all traces to the subplots.
-            fig = make_subplots(rows=3, cols=1, subplot_titles=['Eigenvalues', 'Modulus', 'Frequency'])
+            if fig is None:
+                fig = make_subplots(rows=4, cols=1,
+                                    subplot_titles=['Eigenvalues', 'Modulus', 'Amplitude x Modulus', 'Frequency'])
 
             shared_style = dict(unselected={"marker": {"opacity": 0.3}, "textfont": {"color": "rgba(0, 0, 0, 0)"}})
             marker_style = {"line": {"width": 2, "color": "#BFC2C2"}}
             for trace in fig_eig.data:
+                row, col = subplot_coords[0]
                 # Plot the unit circle
                 fig.add_trace(go.Scatter(x=np.cos(np.linspace(0, 2 * np.pi, 100)),
                                          y=np.sin(np.linspace(0, 2 * np.pi, 100)),
@@ -526,7 +560,7 @@ class ModesInfo:
                                          line=dict(color='rgba(204, 0, 102,100)', width=4),
                                          name="Unit Circle",
                                          showlegend=False),
-                              row=1, col=1)
+                              row=row, col=col)
                 meta = dict(xaxis='eigvals_re', yaxis='eigvals_im')
                 trace.update(meta=meta, **shared_style)
                 trace.marker.update(**marker_style)
@@ -541,32 +575,42 @@ class ModesInfo:
                 fig.update_yaxes(title_text="Imaginary",
                                  autorange=False,
                                  range=[y_min, y_max],
-                                 row=1, col=1)
+                                 row=row, col=col)
                 fig.update_xaxes(title_text="Real",
                                  scaleanchor="y",
                                  autorange=False,
                                  range=[x_min, x_max],
-                                 scaleratio=1, row=1, col=1)
+                                 scaleratio=1, row=row, col=col)
             for trace in fig_modulus.data:
+                row, col = subplot_coords[1]
                 meta = dict(xaxis='modes_sorted_idx', yaxis='modes_modulus')
                 trace.update(meta=meta, **shared_style, showlegend=False)
                 trace.on_selection(self.selection_callback_handler)
                 trace.marker.update(**marker_style)
-                fig.add_trace(trace, row=2, col=1,)
-                fig.update_yaxes(title_text="Modulus", row=2, col=1)
-                fig.update_xaxes(title_text="Modes", row=2, col=1)
+                fig.add_trace(trace, row=row, col=col)
+                fig.update_yaxes(title_text="Modulus", row=row, col=col)
+                fig.update_xaxes(title_text="Modes", row=row, col=col)
+            for trace in fig_mod_amplitude.data:
+                row, col = subplot_coords[2]
+                meta = dict(xaxis='modes_sorted_idx', yaxis='modulus-amplitude')
+                trace.update(meta=meta, **shared_style, showlegend=False)
+                trace.on_selection(self.selection_callback_handler)
+                trace.marker.update(**marker_style)
+                fig.add_trace(trace, row=row, col=col)
+                fig.update_yaxes(title_text="Amplitude x Modulus", row=row, col=col)
+                fig.update_xaxes(title_text="Modes", row=row, col=col)
             for trace in fig_freq.data:
+                row, col = subplot_coords[3]
                 meta = dict(xaxis='modes_sorted_idx', yaxis='modes_frequencies')
                 trace.update(meta=meta, **shared_style, showlegend=False)
                 trace.on_selection(self.selection_callback_handler)
                 trace.marker.update(**marker_style)
-                fig.add_trace(trace, row=3, col=1)
+                fig.add_trace(trace, row=row, col=col)
                 fig.update_yaxes(
-                    title_text=f"Frequency [{'Hz' if self.dt != 1.0 else '1/steps'}]", row=3, col=1)
-                fig.update_xaxes(title_text="Modes", row=3, col=1)
+                    title_text=f"Frequency [{'Hz' if self.dt != 1.0 else '1/steps'}]", row=row, col=col)
+                fig.update_xaxes(title_text="Modes", row=row, col=col)
 
-
-            fig.update_layout(dragmode="select", # instead of zooming in allow user to select ranges.
+            fig.update_layout(dragmode="select",  # instead of zooming in allow user to select ranges.
                               # hovermode=False,
                               # newselection_mode="lasso",
                               template=self.plotly_template,

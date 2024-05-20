@@ -219,8 +219,9 @@ class DynamicAE(LatentBaseModel):
     def modes(self,
               state: TensorContextDataset,
               predict_observables: bool = False,
+              **kwargs
               ):
-        modes_info = super().modes(state, predict_observables=predict_observables)
+        modes_info = super().modes(state=state, predict_observables=predict_observables, **kwargs)
         # Store the linear decoder for mode decomposition in original state space.
         modes_info.linear_decoder = self.lin_decoder
         return modes_info

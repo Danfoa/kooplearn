@@ -211,6 +211,7 @@ class LatentBaseModel(kooplearn.abc.BaseModel, torch.nn.Module, ABC):
             if not hasattr(self, "_eigvals"): self.eig()  # Ensure eigendecomposition is in cache
             # T = V Λ V^-1 : V = eigvecs_r, Λ = eigvals, V^-1 = eigvecs_r_inv
             eigvals, eigvecs_r, eigvecs_r_inv = self._eigvals, self._eigvecs_r, self._eigvecs_r_inv
+            # Compute the inner product between each dimension of the state observable and the eigenfunctions
             z_0_eigbasis = torch.einsum("oi,...i->...o", eigvecs_r_inv.data, z_0.to(dtype=eigvecs_r.dtype))
             # Compute the powers of the eigenvalues used to evolve the latent state z_t | t in [0, context_length]
             # powered_eigvals: (context_length, latent_dim) -> [1, λ, λ^2, ..., λ^context_length]
@@ -224,7 +225,6 @@ class LatentBaseModel(kooplearn.abc.BaseModel, torch.nn.Module, ABC):
                 eigvecs_r.data.to(dtype=z_t_eigbasis.dtype),
                 z_t_eigbasis
                 ).real.to(dtype=z_0.dtype)
-            print("")
         else:
             # T : (latent_dim, latent_dim)
             evolution_operator = self.evolution_operator
@@ -327,6 +327,7 @@ class LatentBaseModel(kooplearn.abc.BaseModel, torch.nn.Module, ABC):
     def modes(self,
               state: TensorContextDataset,
               predict_observables: bool = False,
+              **modes_info_kwargs,
               ):
         r"""Compute the mode decomposition of the state and/or observables
 
@@ -364,7 +365,8 @@ class LatentBaseModel(kooplearn.abc.BaseModel, torch.nn.Module, ABC):
         return ModesInfo(dt=1.0,
                          eigvals=eigvals,
                          eigvecs_r=self._eigvecs_r.detach().cpu().numpy(),
-                         state_eigenbasis=z_t_eig)
+                         state_eigenbasis=z_t_eig,
+                         **modes_info_kwargs)
 
     def predict(
             self,

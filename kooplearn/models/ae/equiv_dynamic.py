@@ -14,6 +14,7 @@ from kooplearn._src.linalg import full_rank_equivariant_lstsq
 from kooplearn.data import TensorContextDataset
 from kooplearn.models import DynamicAE
 from kooplearn.models.ae.utils import flatten_context_data, unflatten_context_data
+from kooplearn.utils import ModesInfo
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +166,19 @@ class EquivDynamicAE(DynamicAE):
 
         # Having computed the eigendecomposition using the block-diagonal structure, default to parent implementation
         return super(EquivDynamicAE, self).eig(eval_left_on, eval_right_on)
+
+    @wraps(DynamicAE.modes)
+    def modes(self,
+              state: TensorContextDataset,
+              predict_observables: bool = False,
+              **kwargs
+              ) -> ModesInfo:
+        modes_info = super(EquivDynamicAE, self).modes(state=state, predict_observables=predict_observables, **kwargs)
+        mode_group = np.empty(self.latent_dim, dtype=object)
+        for iso_id, iso_dims in self.latent_iso_dims.items():
+            mode_group[iso_dims] = (iso_id,)
+        modes_info.modes_group = mode_group[modes_info._sorted_eigs_indices]
+        return modes_info
 
     @wraps(DynamicAE.get_latent_space_orth_metrics)  # Copies docstring from parent implementation
     def get_latent_space_orth_metrics(self, latent_obs, with_grad: bool = False):
